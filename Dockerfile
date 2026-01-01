@@ -1,7 +1,7 @@
 # Dockerfile for VideoPrism Video Embedding Server with GPU Support
 # Uses NVIDIA CUDA base image with uv for fast, reproducible dependency management
 
-FROM nvidia/cuda:12.6.2-cudnn-runtime-ubuntu22.04
+FROM nvidia/cuda:12.6.2-cudnn-devel-ubuntu22.04
 
 # Copy uv binary from official image for fast package management
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /bin/uv
