@@ -6,3 +6,7 @@ flax
 huggingface-hub
 sentencepiece
 tensorflow[and-cuda]
+fastapi
+uvicorn[standard]
+python-multipart
+requests

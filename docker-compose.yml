@@ -27,6 +27,8 @@ services:
       - NVIDIA_VISIBLE_DEVICES=all
       - TF_FORCE_GPU_ALLOW_GROWTH=true
       - XLA_PYTHON_CLIENT_MEM_FRACTION=0.9
+      # Uncomment to use pre-computed embeddings (faster startup)
+      # - EMBEDDINGS_FOLDER=/app/data/embeddings
     
     volumes:
       # Mount for input videos (optional - adjust path as needed)
@@ -38,9 +40,8 @@ services:
     stdin_open: true
     tty: true
     
-    # Uncomment to expose a port if you add a web server
-    # ports:
-    #   - "8000:8000"
+    ports:
+      - "8000:8000"
 
   # Alternative service using vanilla CUDA Dockerfile
   # Uncomment to use instead of the NGC-based image

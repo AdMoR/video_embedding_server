@@ -43,6 +43,9 @@ RUN pip install --no-cache-dir \
     "huggingface-hub>=0.36.0" \
     "mediapy>=1.2.5" \
     "sentencepiece>=0.2.1" \
+    "fastapi>=0.115.0" \
+    "uvicorn[standard]>=0.32.0" \
+    "python-multipart>=0.0.12" \
     pillow
 
 # Copy the rest of the application
@@ -65,5 +68,8 @@ ENV XLA_PYTHON_CLIENT_MEM_FRACTION=0.9
 # Verify GPU setup on container start (optional, comment out for production)
 # RUN python -c "import jax; print('JAX devices:', jax.devices())"
 
-# Default command
-CMD ["python", "main.py"]
+# Expose port for the API server
+EXPOSE 8000
+
+# Default command - run the FastAPI server
+CMD ["python", "server.py"]
