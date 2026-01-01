@@ -5,8 +5,6 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-      # To use the alternative CUDA-based Dockerfile:
-      # dockerfile: Dockerfile.cuda
     image: video-embedding-server:latest
     container_name: video-embedding-server
     
@@ -43,31 +41,5 @@ services:
     ports:
       - "8000:8000"
 
-  # Alternative service using vanilla CUDA Dockerfile
-  # Uncomment to use instead of the NGC-based image
-  # video-embedding-server-cuda:
-  #   build:
-  #     context: .
-  #     dockerfile: Dockerfile.cuda
-  #   image: video-embedding-server-cuda:latest
-  #   container_name: video-embedding-server-cuda
-  #   deploy:
-  #     resources:
-  #       reservations:
-  #         devices:
-  #           - driver: nvidia
-  #             count: all
-  #             capabilities: [gpu]
-  #   environment:
-  #     - NVIDIA_VISIBLE_DEVICES=all
-  #     - TF_FORCE_GPU_ALLOW_GROWTH=true
-  #     - XLA_PYTHON_CLIENT_MEM_FRACTION=0.9
-  #   volumes:
-  #     - ./data:/app/data
-  #     - huggingface-cache:/root/.cache/huggingface
-  #   stdin_open: true
-  #   tty: true
-
 volumes:
   huggingface-cache:
-
