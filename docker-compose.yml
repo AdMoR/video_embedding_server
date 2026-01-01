@@ -1,0 +1,72 @@
+version: '3.8'
+
+services:
+  video-embedding-server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      # To use the alternative CUDA-based Dockerfile:
+      # dockerfile: Dockerfile.cuda
+    image: video-embedding-server:latest
+    container_name: video-embedding-server
+    
+    # GPU support - requires NVIDIA Container Toolkit
+    # Install: https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all  # Use 'all' for all GPUs, or specify a number like 1
+              capabilities: [gpu]
+    
+    # Alternative GPU syntax (for older docker-compose versions)
+    # runtime: nvidia
+    
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - TF_FORCE_GPU_ALLOW_GROWTH=true
+      - XLA_PYTHON_CLIENT_MEM_FRACTION=0.9
+    
+    volumes:
+      # Mount for input videos (optional - adjust path as needed)
+      - ./data:/app/data
+      # Mount for model cache (speeds up subsequent runs)
+      - huggingface-cache:/root/.cache/huggingface
+    
+    # Keep container running for interactive use
+    stdin_open: true
+    tty: true
+    
+    # Uncomment to expose a port if you add a web server
+    # ports:
+    #   - "8000:8000"
+
+  # Alternative service using vanilla CUDA Dockerfile
+  # Uncomment to use instead of the NGC-based image
+  # video-embedding-server-cuda:
+  #   build:
+  #     context: .
+  #     dockerfile: Dockerfile.cuda
+  #   image: video-embedding-server-cuda:latest
+  #   container_name: video-embedding-server-cuda
+  #   deploy:
+  #     resources:
+  #       reservations:
+  #         devices:
+  #           - driver: nvidia
+  #             count: all
+  #             capabilities: [gpu]
+  #   environment:
+  #     - NVIDIA_VISIBLE_DEVICES=all
+  #     - TF_FORCE_GPU_ALLOW_GROWTH=true
+  #     - XLA_PYTHON_CLIENT_MEM_FRACTION=0.9
+  #   volumes:
+  #     - ./data:/app/data
+  #     - huggingface-cache:/root/.cache/huggingface
+  #   stdin_open: true
+  #   tty: true
+
+volumes:
+  huggingface-cache:
+
