@@ -15,8 +15,10 @@ services:
         reservations:
           devices:
             - driver: nvidia
-              count: all  # Use 'all' for all GPUs, or specify a number like 1
+              count: 1  # Use 'all' for all GPUs, or specify a number like 1
               capabilities: [gpu]
+    devices:
+      - /dev/nvidia0:/dev/nvidia0
     
     # Alternative GPU syntax (for older docker-compose versions)
     # runtime: nvidia
@@ -26,11 +28,11 @@ services:
       - TF_FORCE_GPU_ALLOW_GROWTH=true
       - XLA_PYTHON_CLIENT_MEM_FRACTION=0.9
       # Uncomment to use pre-computed embeddings (faster startup)
-      # - EMBEDDINGS_FOLDER=/app/data/embeddings
+      - EMBEDDINGS_FOLDER=/app/data/embeddings
     
     volumes:
       # Mount for input videos (optional - adjust path as needed)
-      - ./data:/app/data
+      - /media/amor/data1/Downloads/CPS/fred_voice_clips_embeddings/:/app/data/embeddings
       # Mount for model cache (speeds up subsequent runs)
       - huggingface-cache:/root/.cache/huggingface
     
