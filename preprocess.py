@@ -3,6 +3,7 @@
 
 import argparse
 import json
+import logging
 import os
 import sys
 from pathlib import Path
@@ -164,7 +165,7 @@ def preprocess_folder(
             print(f"  Saved: {embedding_file.name} (shape: {embedding.shape})")
 
         except Exception as e:
-            print(f"  Error processing {video_file.name}: {e}")
+            logging.error(f"  Error processing {video_file.name}: {e}", exc_info=True)
             continue
 
     # Save metadata

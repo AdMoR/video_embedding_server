@@ -1,6 +1,7 @@
 """FastAPI server for video embedding similarity queries."""
 
 import json
+import logging
 import os
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -16,8 +17,12 @@ from videoprism import models as vp
 
 # Configuration
 MODEL_NAME = os.getenv("MODEL_NAME", "videoprism_lvt_public_v1_base")
-VIDEO_FOLDER = os.getenv("VIDEO_FOLDER", "./videoprism/assets/")
+VIDEO_FOLDER = os.getenv("VIDEO_FOLDER", "")
 EMBEDDINGS_FOLDER = os.getenv("EMBEDDINGS_FOLDER", "")  # If set, load pre-computed embeddings
+
+print(VIDEO_FOLDER)
+print(EMBEDDINGS_FOLDER)
+
 NUM_FRAMES = 16
 FRAME_SIZE = 288
 USE_BFLOAT16 = False
@@ -31,6 +36,9 @@ text_tokenizer = None
 video_registry: dict[str, np.ndarray] = {}  # video_id -> embedding
 cached_dummy_frames = None  # Cached dummy frames for text embedding computation
 
+
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
 
 def read_and_preprocess_video(
     filename: str, target_num_frames: int, target_frame_size: tuple[int, int]
@@ -110,14 +118,14 @@ def load_embeddings_from_folder():
     metadata_file = embeddings_path / "metadata.json"
 
     if not metadata_file.exists():
-        print(f"Warning: metadata.json not found in {EMBEDDINGS_FOLDER}")
+        logger.info(f"Warning: metadata.json not found in {EMBEDDINGS_FOLDER}")
         return False
 
     with open(metadata_file) as f:
         metadata = json.load(f)
 
-    print(f"Loading embeddings from: {EMBEDDINGS_FOLDER}")
-    print(f"  Model: {metadata.get('model_name', 'unknown')}")
+    logger.info(f"Loading embeddings from: {EMBEDDINGS_FOLDER}")
+    logger.info(f"  Model: {metadata.get('model_name', 'unknown')}")
 
     videos_metadata = metadata.get("videos", {})
     for video_name, video_info in videos_metadata.items():
@@ -130,9 +138,9 @@ def load_embeddings_from_folder():
                 "name": video_name,
             }
         else:
-            print(f"  Warning: Embedding file not found: {embedding_file}")
+            logger.info(f"  Warning: Embedding file not found: {embedding_file}")
 
-    print(f"Loaded {len(video_registry)} embeddings from pre-computed folder")
+    logger.info(f"Loaded {len(video_registry)} embeddings from pre-computed folder")
     return len(video_registry) > 0
 
 
@@ -171,9 +179,9 @@ def load_videos_from_folder():
                 "embedding": video_embedding,
                 "name": f"water_bottle_drumming_{i+1}",
             }
-        print(f"Loaded {len(video_registry)} videos into registry")
+        logger.info(f"Loaded {len(video_registry)} videos into registry")
     else:
-        print(f"Warning: Demo video not found at {demo_video_path}")
+        logger.info(f"Warning: Demo video not found at {demo_video_path}")
 
 
 def create_dummy_frames():
@@ -189,16 +197,17 @@ def create_dummy_frames():
         dummy_frames = dummy_frames.astype(jnp.bfloat16)
 
     cached_dummy_frames = dummy_frames
-    print("Created cached dummy frames for text embedding computation")
+    logger.info("Created cached dummy frames for text embedding computation")
 
 
 def load_videos():
     """Load videos - either from pre-computed embeddings or by computing them."""
     if EMBEDDINGS_FOLDER and os.path.isdir(EMBEDDINGS_FOLDER):
         if load_embeddings_from_folder():
+            logger.info("Success for embedding loading")
             create_dummy_frames()
             return
-        print("Falling back to computing embeddings from videos...")
+        logger.info("Falling back to computing embeddings from videos...")
 
     load_videos_from_folder()
 
@@ -208,20 +217,20 @@ async def lifespan(app: FastAPI):
     """Initialize model and load videos on startup."""
     global flax_model, loaded_state, text_tokenizer
 
-    print(f"Loading model: {MODEL_NAME}")
+    logger.info(f"Loading model: {MODEL_NAME}")
     fprop_dtype = jnp.bfloat16 if USE_BFLOAT16 else None
     flax_model = vp.get_model(MODEL_NAME, fprop_dtype=fprop_dtype)
     loaded_state = vp.load_pretrained_weights(MODEL_NAME)
     text_tokenizer = vp.load_text_tokenizer("c4_en")
-    print("Model loaded successfully")
+    logger.info("Model loaded successfully")
 
-    print("Loading videos...")
+    logger.info("Loading videos...")
     load_videos()
 
     yield
 
     # Cleanup (if needed)
-    print("Shutting down...")
+    logger.info("Shutting down...")
 
 
 app = FastAPI(
@@ -293,6 +302,7 @@ async def search(request: SearchRequest):
 
     # Compute similarity with all videos
     video_ids = list(video_registry.keys())
+    logger.info(video_ids)
     video_embeddings = [video_registry[vid]["embedding"] for vid in video_ids]
 
     similarity_matrix = compute_similarity_matrix(
