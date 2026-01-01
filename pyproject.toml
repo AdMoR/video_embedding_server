@@ -1,0 +1,18 @@
+[project]
+name = "videoprism"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "absl-py>=2.3.1",
+    "einops>=0.8.1",
+    "einshape>=1.0",
+    "flax>=0.11.2",
+    "huggingface-hub>=0.36.0",
+    "jax[cuda13-local]>=0.6.2",
+    "mediapy>=1.2.5",
+    "numpy>=1.26",
+    "sentencepiece>=0.2.1",
+    "tensorflow[and-cuda]>=2.20.0",
+]
