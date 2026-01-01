@@ -1,12 +1,22 @@
 version: '3.8'
 
 services:
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: qdrant
+    ports:
+      - "6333:6333"
+    volumes:
+      - qdrant_data:/qdrant/storage
+
   video-embedding-server:
     build:
       context: .
       dockerfile: Dockerfile
     image: video-embedding-server:latest
     container_name: video-embedding-server
+    depends_on:
+      - qdrant
     
     # GPU support - requires NVIDIA Container Toolkit
     # Install: https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html
@@ -29,6 +39,9 @@ services:
       - XLA_PYTHON_CLIENT_MEM_FRACTION=0.9
       # Uncomment to use pre-computed embeddings (faster startup)
       - EMBEDDINGS_FOLDER=/app/data/embeddings
+      # Qdrant connection
+      - QDRANT_HOST=qdrant
+      - QDRANT_PORT=6333
     
     volumes:
       # Mount for input videos (optional - adjust path as needed)
@@ -45,3 +58,4 @@ services:
 
 volumes:
   huggingface-cache:
+  qdrant_data:

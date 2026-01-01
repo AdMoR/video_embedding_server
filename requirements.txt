@@ -10,3 +10,4 @@ fastapi
 uvicorn[standard]
 python-multipart
 requests
+qdrant-client>=1.7.0
