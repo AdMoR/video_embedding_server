@@ -446,14 +446,14 @@ def main():
     parser.add_argument(
         "--min-duration",
         type=float,
-        default=1.0,
+        default=0.0,
         help="Minimum video duration in seconds (default: 1.0)",
     )
     parser.add_argument(
         "--workers",
         "-w",
         type=int,
-        default=1,
+        default=0,
         help="Number of parallel workers (default: 1, use 0 for CPU count)",
     )
 
