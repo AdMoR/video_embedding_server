@@ -26,12 +26,15 @@ Identity configuration (identities.json):
 
 Usage:
     python build_tags.py ./videos tags.json --identities identities.json
+    python build_tags.py ./videos tags.json --identities identities.json --workers 8
 """
 
 import argparse
 import json
+import multiprocessing as mp
 import os
 import subprocess
+from functools import partial
 from pathlib import Path
 
 import cv2
@@ -217,7 +220,7 @@ def faces_to_tags(
     return tags
 
 
-def process_video(
+def process_single_video(
     video_path: Path,
     known_face_encodings: list,
     known_face_names: list[str],
@@ -257,6 +260,158 @@ def process_video(
     return tags
 
 
+def process_video_worker(args: tuple) -> tuple[str, list[dict], str | None]:
+    """Worker function for multiprocessing.
+
+    Args:
+        args: Tuple of (video_path, known_encodings, known_names, speed_up_factor)
+
+    Returns:
+        Tuple of (video_name, tags, error_message or None)
+    """
+    video_path, known_encodings, known_names, speed_up_factor = args
+    video_name = Path(video_path).stem
+
+    try:
+        tags = process_single_video(
+            Path(video_path),
+            known_encodings,
+            known_names,
+            speed_up_factor=speed_up_factor,
+        )
+        return (video_name, tags, None)
+    except Exception as e:
+        return (video_name, [], str(e))
+
+
+def process_videos_parallel(
+    video_files: list[Path],
+    known_encodings: list,
+    known_names: list[str],
+    speed_up_factor: int,
+    num_workers: int,
+    min_duration: float,
+) -> tuple[dict, int]:
+    """Process videos in parallel using multiprocessing.
+
+    Args:
+        video_files: List of video file paths.
+        known_encodings: Face encodings to match against.
+        known_names: Names for the encodings.
+        speed_up_factor: Process every N seconds.
+        num_workers: Number of parallel workers.
+        min_duration: Minimum video duration to process.
+
+    Returns:
+        Tuple of (tags dict, skipped count)
+    """
+    # Filter videos by duration and prepare work items
+    work_items = []
+    skipped = 0
+
+    print(f"\nChecking video durations...")
+    for video_file in sorted(video_files):
+        duration = get_video_duration(str(video_file))
+        if duration < min_duration:
+            skipped += 1
+            continue
+        work_items.append((
+            str(video_file),
+            known_encodings,
+            known_names,
+            speed_up_factor,
+        ))
+
+    if not work_items:
+        return {}, skipped
+
+    print(f"Processing {len(work_items)} videos with {num_workers} workers...")
+    print()
+
+    tags = {}
+    completed = 0
+    total = len(work_items)
+
+    # Use spawn to avoid issues with fork and numpy/opencv
+    ctx = mp.get_context("spawn")
+
+    with ctx.Pool(processes=num_workers) as pool:
+        for video_name, video_tags, error in pool.imap_unordered(
+            process_video_worker, work_items
+        ):
+            completed += 1
+
+            if error:
+                print(f"[{completed}/{total}] {video_name}: Error - {error}")
+                tags[video_name] = []
+            elif video_tags:
+                tag_names = [t["name"] for t in video_tags]
+                print(f"[{completed}/{total}] {video_name}: Found {tag_names}")
+                tags[video_name] = video_tags
+            else:
+                print(f"[{completed}/{total}] {video_name}: No faces detected")
+                tags[video_name] = []
+
+    return tags, skipped
+
+
+def process_videos_sequential(
+    video_files: list[Path],
+    known_encodings: list,
+    known_names: list[str],
+    speed_up_factor: int,
+    min_duration: float,
+) -> tuple[dict, int]:
+    """Process videos sequentially (single-threaded).
+
+    Args:
+        video_files: List of video file paths.
+        known_encodings: Face encodings to match against.
+        known_names: Names for the encodings.
+        speed_up_factor: Process every N seconds.
+        min_duration: Minimum video duration to process.
+
+    Returns:
+        Tuple of (tags dict, skipped count)
+    """
+    tags = {}
+    skipped = 0
+    total = len(video_files)
+
+    for i, video_file in enumerate(sorted(video_files), 1):
+        video_name = video_file.stem
+
+        # Check duration
+        duration = get_video_duration(str(video_file))
+        if duration < min_duration:
+            print(f"[{i}/{total}] Skipping {video_name} (too short: {duration:.1f}s)")
+            skipped += 1
+            continue
+
+        print(f"[{i}/{total}] Processing: {video_name} ({duration:.1f}s)")
+
+        try:
+            video_tags = process_single_video(
+                video_file,
+                known_encodings,
+                known_names,
+                speed_up_factor=speed_up_factor,
+            )
+            tags[video_name] = video_tags
+
+            if video_tags:
+                tag_names = [t["name"] for t in video_tags]
+                print(f"  Found: {tag_names}")
+            else:
+                print("  No faces detected")
+
+        except Exception as e:
+            print(f"  Error: {e}")
+            tags[video_name] = []
+
+    return tags, skipped
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Generate tags for videos using face recognition"
@@ -293,6 +448,13 @@ def main():
         type=float,
         default=1.0,
         help="Minimum video duration in seconds (default: 1.0)",
+    )
+    parser.add_argument(
+        "--workers",
+        "-w",
+        type=int,
+        default=1,
+        help="Number of parallel workers (default: 1, use 0 for CPU count)",
     )
 
     args = parser.parse_args()
@@ -336,40 +498,32 @@ def main():
 
     print(f"\nFound {len(video_files)} video(s) to process")
 
-    # Process each video
-    tags = {}
-    skipped = 0
+    # Determine number of workers
+    num_workers = args.workers
+    if num_workers == 0:
+        num_workers = mp.cpu_count()
+    elif num_workers < 0:
+        num_workers = max(1, mp.cpu_count() + num_workers)
 
-    for i, video_file in enumerate(sorted(video_files), 1):
-        video_name = video_file.stem
-
-        # Check duration
-        duration = get_video_duration(str(video_file))
-        if duration < args.min_duration:
-            print(f"[{i}/{len(video_files)}] Skipping {video_name} (too short: {duration:.1f}s)")
-            skipped += 1
-            continue
-
-        print(f"[{i}/{len(video_files)}] Processing: {video_name} ({duration:.1f}s)")
-
-        try:
-            video_tags = process_video(
-                video_file,
-                known_encodings,
-                known_names,
-                speed_up_factor=args.speed_up,
-            )
-            tags[video_name] = video_tags
-
-            if video_tags:
-                tag_names = [t["name"] for t in video_tags]
-                print(f"  Found: {tag_names}")
-            else:
-                print("  No faces detected")
-
-        except Exception as e:
-            print(f"  Error: {e}")
-            tags[video_name] = []
+    # Process videos
+    if num_workers > 1:
+        print(f"Using {num_workers} parallel workers")
+        tags, skipped = process_videos_parallel(
+            video_files,
+            known_encodings,
+            known_names,
+            args.speed_up,
+            num_workers,
+            args.min_duration,
+        )
+    else:
+        tags, skipped = process_videos_sequential(
+            video_files,
+            known_encodings,
+            known_names,
+            args.speed_up,
+            args.min_duration,
+        )
 
     # Write output
     with open(args.output_file, "w") as f:
