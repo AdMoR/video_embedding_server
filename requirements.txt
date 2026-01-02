@@ -11,3 +11,6 @@ uvicorn[standard]
 python-multipart
 requests
 qdrant-client>=1.7.0
+# For build_tags.py face recognition
+face_recognition
+opencv-python

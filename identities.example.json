@@ -1,0 +1,13 @@
+{
+  "fred": [
+    "/path/to/fred_1.jpeg",
+    "/path/to/fred_2.jpeg",
+    "/path/to/fred_3.jpeg"
+  ],
+  "jamy": [
+    "/path/to/jamy_1.jpeg",
+    "/path/to/jamy_2.jpeg",
+    "/path/to/jamy_3.jpeg"
+  ]
+}
+
