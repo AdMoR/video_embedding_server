@@ -35,7 +35,7 @@ services:
     stdin_open: true
     tty: true
     ports:
-      - "8000:8000"
+      - "8004:8004"
 
 volumes:
   huggingface-cache:

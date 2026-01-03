@@ -114,13 +114,13 @@ class VectorStore:
             else:
                 query_filter = Filter(should=conditions)
 
-        results = self.client.query(
+        results = self.client.query_points(
             collection_name=collection,
             query=query_embedding,
             query_filter=query_filter,
             limit=top_k,
         )
-        return [{"id": r.id, "score": r.score, **r.payload} for r in results]
+        return [{"id": r.id, "score": r.score, **r.payload} for r in results.points]
 
     def get_all_tags(self, collection: str) -> list[str]:
         """Get all unique tag names in the collection.

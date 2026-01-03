@@ -61,7 +61,7 @@ ENV XLA_PYTHON_CLIENT_MEM_FRACTION=0.9
 ENV XLA_FLAGS="--xla_gpu_cuda_data_dir=/usr/local/cuda"
 
 # Expose port for the API server
-EXPOSE 8000
+EXPOSE 8004
 
 # Default command - run the FastAPI server using the uv-managed environment
 CMD ["uv", "run", "python", "server.py"]
