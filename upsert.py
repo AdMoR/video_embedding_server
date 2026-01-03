@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Upsert embeddings and tags into Qdrant.
+"""Upsert embeddings and tags into the video embedding server.
 
-This script combines pre-computed embeddings (from preprocess.py) with tags
-(from build_tags.py or another source) and uploads them to Qdrant.
+This script reads pre-computed embeddings (from preprocess.py) and tags
+(from build_tags.py or another source) and uploads them via the server's
+/upsert endpoint, which handles MinIO storage and Qdrant insertion.
 
 Usage:
     python upsert.py ./embeddings --collection my_project --tags-file tags.json
@@ -14,13 +15,12 @@ import sys
 from pathlib import Path
 
 import numpy as np
-
-from storage import VectorStore
+import requests
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Upsert embeddings and tags into Qdrant"
+        description="Upsert embeddings and tags via the video embedding server"
     )
     parser.add_argument(
         "embeddings_folder",
@@ -36,15 +36,9 @@ def main():
         help="JSON file with tags per video: {'video1': [{'name': 'X', 'start': 0, 'end': 10}]}",
     )
     parser.add_argument(
-        "--qdrant-host",
-        default="localhost",
-        help="Qdrant server hostname (default: localhost)",
-    )
-    parser.add_argument(
-        "--qdrant-port",
-        type=int,
-        default=6333,
-        help="Qdrant server port (default: 6333)",
+        "--server-url",
+        default="http://localhost:8004",
+        help="Video embedding server URL (default: http://localhost:8004)",
     )
 
     args = parser.parse_args()
@@ -84,61 +78,72 @@ def main():
             tags_mapping = json.load(f)
         print(f"Loaded tags for {len(tags_mapping)} videos")
 
-    # Connect to Qdrant
-    print(f"Connecting to Qdrant at {args.qdrant_host}:{args.qdrant_port}")
-    store = VectorStore(host=args.qdrant_host, port=args.qdrant_port)
-    store.ensure_collection(args.collection)
-    print(f"Using collection: {args.collection}")
+    # Upsert each video via the server
+    server_url = args.server_url.rstrip("/")
+    upsert_url = f"{server_url}/upsert"
+    print(f"Using server: {server_url}")
 
-    # Upsert each video
     success_count = 0
     error_count = 0
 
     for video_name, video_info in videos_metadata.items():
         embedding_file = embeddings_path / video_info["embedding_file"]
-        print(embedding_file)
+        source_path = video_info.get("source_path", "")
+
         if not embedding_file.exists():
             print(f"  Warning: Embedding file not found: {embedding_file}")
             error_count += 1
             continue
 
+        if not source_path or not Path(source_path).exists():
+            print(f"  Warning: Source video not found: {source_path}")
+            error_count += 1
+            continue
 
         # Load embedding
         embedding = np.load(embedding_file)
-        print(embedding)
+        embedding_list = embedding.tolist()
 
         # Get tags for this video (empty list if not provided)
         video_tags = tags_mapping.get(video_name, [])
 
-        # Get duration if available
-        duration = video_info.get("duration", 0.0)
+        # Prepare multipart form data
+        video_path = Path(source_path)
+        
+        try:
+            with open(video_path, "rb") as video_file:
+                files = {
+                    "file": (video_path.name, video_file, "video/mp4"),
+                }
+                data = {
+                    "collection": args.collection,
+                    "embedding": json.dumps(embedding_list),
+                    "tags": json.dumps(video_tags),
+                }
 
-        # Get source path
-        source_path = video_info.get("source_path", "")
+                response = requests.post(upsert_url, files=files, data=data)
 
-        # Upsert to Qdrant
-        segment_id = f"{video_name}_seg_0"
-        store.upsert(
-            collection=args.collection,
-            segment_id=segment_id,
-            embedding=embedding.tolist(),
-            video_id=video_name,
-            tags=video_tags,
-            duration=duration,
-            segment_index=0,
-            source_path=source_path,
-        )
+            if response.status_code == 200:
+                result = response.json()
+                tag_count = len(video_tags)
+                print(f"  Upserted: {video_name} ({tag_count} tags) -> {result['minio_path']}")
+                success_count += 1
+            else:
+                print(f"  Error uploading {video_name}: {response.status_code} - {response.text}")
+                error_count += 1
 
-        tag_count = len(video_tags)
-        print(f"  Upserted: {video_name} ({tag_count} tags)")
-        success_count += 1
-
+        except requests.RequestException as e:
+            print(f"  Error uploading {video_name}: {e}")
+            error_count += 1
+        except Exception as e:
+            print(f"  Error processing {video_name}: {e}")
+            error_count += 1
 
     # Summary
     print()
-    print(f"Total segments in collection: {store.count(args.collection)}")
+    print(f"Successfully upserted: {success_count}")
+    print(f"Errors: {error_count}")
 
 
 if __name__ == "__main__":
     main()
-
