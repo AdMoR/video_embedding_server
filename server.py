@@ -205,6 +205,18 @@ class UpsertResponse(BaseModel):
     video_id: str
 
 
+class DeleteVideoResponse(BaseModel):
+    video_id: str
+    deleted_segments: int
+    deleted_files: int
+
+
+class PurgeCollectionResponse(BaseModel):
+    collection: str
+    purged_segments: int
+    deleted_files: int
+
+
 @app.get("/health")
 async def health():
     """Health check endpoint."""
@@ -357,17 +369,28 @@ async def upsert(
                     detail=f"Invalid JSON in tags: {e}",
                 )
 
-        # Upload video to MinIO
-        minio_key = f"videos/{collection}/{filename}"
-        minio_path = await minio_client.upload_file(temp_path, minio_key)
-        logger.info(f"Uploaded video to MinIO: {minio_path}")
-
         # Ensure collection exists
         vector_store.ensure_collection(collection)
 
         # Generate video_id from filename (without extension)
         video_id = Path(filename).stem
         segment_id = f"{video_id}_seg_0"
+
+        # Delete existing video if present (auto-cleanup)
+        existing_paths = vector_store.delete_by_video_id(collection, video_id)
+        if existing_paths:
+            logger.info(f"Replacing existing video '{video_id}' ({len(existing_paths)} segments)")
+            # Delete old files from MinIO
+            for path in existing_paths:
+                if path.startswith("minio://"):
+                    parts = path.replace("minio://", "").split("/", 1)
+                    if len(parts) == 2:
+                        await minio_client.delete_object(parts[1])
+
+        # Upload video to MinIO
+        minio_key = f"videos/{collection}/{filename}"
+        minio_path = await minio_client.upload_file(temp_path, minio_key)
+        logger.info(f"Uploaded video to MinIO: {minio_path}")
 
         # Upsert to Qdrant with MinIO path
         vector_store.upsert(
@@ -394,6 +417,87 @@ async def upsert(
             os.remove(temp_path)
         if os.path.exists(temp_dir):
             os.rmdir(temp_dir)
+
+
+@app.delete("/videos/{collection}/{video_id}", response_model=DeleteVideoResponse)
+async def delete_video(collection: str, video_id: str):
+    """
+    Delete a video and all its segments from Qdrant and MinIO.
+
+    Args:
+        collection: Name of the collection
+        video_id: ID of the video to delete
+    """
+    global minio_client
+
+    # Validate collection exists
+    if collection not in vector_store.list_collections():
+        raise HTTPException(
+            status_code=404, detail=f"Collection '{collection}' not found"
+        )
+
+    # Delete from Qdrant and get source paths
+    source_paths = vector_store.delete_by_video_id(collection, video_id)
+
+    if not source_paths:
+        raise HTTPException(
+            status_code=404, detail=f"Video '{video_id}' not found in collection '{collection}'"
+        )
+
+    # Delete files from MinIO
+    deleted_files = 0
+    for path in source_paths:
+        # Extract key from minio:// URI
+        if path.startswith("minio://"):
+            # Format: minio://{bucket}/{key}
+            parts = path.replace("minio://", "").split("/", 1)
+            if len(parts) == 2:
+                key = parts[1]
+                await minio_client.delete_object(key)
+                deleted_files += 1
+
+    logger.info(f"Deleted video '{video_id}' from collection '{collection}': {len(source_paths)} segments, {deleted_files} files")
+
+    return DeleteVideoResponse(
+        video_id=video_id,
+        deleted_segments=len(source_paths),
+        deleted_files=deleted_files,
+    )
+
+
+@app.delete("/collections/{collection}/purge", response_model=PurgeCollectionResponse)
+async def purge_collection(collection: str):
+    """
+    Purge all data from a collection (Qdrant + MinIO).
+
+    This deletes all segments from the Qdrant collection and all video files
+    under the videos/{collection}/ prefix in MinIO.
+    """
+    global minio_client
+
+    # Validate collection exists
+    if collection not in vector_store.list_collections():
+        raise HTTPException(
+            status_code=404, detail=f"Collection '{collection}' not found"
+        )
+
+    # Get count before purge
+    count_before = vector_store.count(collection)
+
+    # Purge Qdrant collection
+    vector_store.purge_collection(collection)
+
+    # Delete all files under videos/{collection}/ in MinIO
+    minio_prefix = f"videos/{collection}/"
+    deleted_files = await minio_client.delete_prefix(minio_prefix)
+
+    logger.info(f"Purged collection '{collection}': {count_before} segments, {deleted_files} files")
+
+    return PurgeCollectionResponse(
+        collection=collection,
+        purged_segments=count_before,
+        deleted_files=deleted_files,
+    )
 
 
 if __name__ == "__main__":

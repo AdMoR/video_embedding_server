@@ -165,3 +165,51 @@ class VectorStore:
         """
         return self.client.count(collection_name=collection).count
 
+    def delete_by_video_id(self, collection: str, video_id: str) -> list[str]:
+        """Delete all segments for a specific video.
+
+        Args:
+            collection: Name of the collection.
+            video_id: ID of the video to delete.
+
+        Returns:
+            List of source_path values (MinIO URIs) for cleanup.
+        """
+        # Find all points matching video_id
+        results, _ = self.client.scroll(
+            collection_name=collection,
+            scroll_filter=Filter(
+                must=[FieldCondition(key="video_id", match=MatchValue(value=video_id))]
+            ),
+            limit=1000,
+            with_payload=["source_path"],
+        )
+
+        if not results:
+            return []
+
+        # Collect source paths for MinIO cleanup
+        source_paths = [
+            p.payload.get("source_path", "")
+            for p in results
+            if p.payload.get("source_path")
+        ]
+
+        # Delete points from Qdrant
+        point_ids = [p.id for p in results]
+        self.client.delete(
+            collection_name=collection,
+            points_selector=point_ids,
+        )
+
+        return source_paths
+
+    def purge_collection(self, collection: str) -> None:
+        """Delete all points in a collection (recreates the collection).
+
+        Args:
+            collection: Name of the collection to purge.
+        """
+        self.client.delete_collection(collection_name=collection)
+        self.ensure_collection(collection)
+
