@@ -141,28 +141,27 @@ def preprocess_folder(
     for i, video_file in enumerate(video_files, 1):
         video_name = video_file.stem
         print(f"[{i}/{len(video_files)}] Processing: {video_file.name}")
-
+        embedding_file = output_path / f"{video_name}.npy"
         try:
-            embedding = compute_video_embedding(
-                str(video_file),
-                flax_model,
-                loaded_state,
-                text_tokenizer,
-                forward_fn,
-            )
-
-            # Save embedding as .npy file
-            embedding_file = output_path / f"{video_name}.npy"
-            np.save(embedding_file, embedding)
+            if not embedding_file.exists():
+                embedding = compute_video_embedding(
+                    str(video_file),
+                    flax_model,
+                    loaded_state,
+                    text_tokenizer,
+                    forward_fn,
+                )
+                #print(embedding)
+                # Save embedding as .npy file
+                np.save(embedding_file, embedding)
 
             # Track metadata
             metadata[video_name] = {
                 "source_path": str(video_file.absolute()),
                 "embedding_file": str(embedding_file.name),
-                "embedding_shape": list(embedding.shape),
             }
 
-            print(f"  Saved: {embedding_file.name} (shape: {embedding.shape})")
+            print(f"  Saved: {embedding_file.name} ")
 
         except Exception as e:
             logging.error(f"  Error processing {video_file.name}: {e}", exc_info=True)

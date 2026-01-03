@@ -1,4 +1,5 @@
 """Qdrant vector store abstraction for video embeddings."""
+import uuid
 
 from qdrant_client import QdrantClient
 from qdrant_client.models import (
@@ -68,7 +69,7 @@ class VectorStore:
             collection_name=collection,
             points=[
                 PointStruct(
-                    id=segment_id,
+                    id=uuid.uuid4(),
                     vector=embedding,
                     payload={
                         "video_id": video_id,
@@ -113,9 +114,9 @@ class VectorStore:
             else:
                 query_filter = Filter(should=conditions)
 
-        results = self.client.search(
+        results = self.client.query(
             collection_name=collection,
-            query_vector=query_embedding,
+            query=query_embedding,
             query_filter=query_filter,
             limit=top_k,
         )

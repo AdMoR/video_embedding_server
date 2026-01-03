@@ -25,7 +25,6 @@ services:
       - JAX_PLATFORM_NAME=cpu
       - CUDA_VISIBLE_DEVICES=
       # Qdrant connection
-      - EMBEDDINGS_FOLDER=/app/data/embeddings
       - QDRANT_HOST=qdrant
       - QDRANT_PORT=6333
     

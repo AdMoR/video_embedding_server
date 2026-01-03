@@ -96,50 +96,46 @@ def main():
 
     for video_name, video_info in videos_metadata.items():
         embedding_file = embeddings_path / video_info["embedding_file"]
-
+        print(embedding_file)
         if not embedding_file.exists():
             print(f"  Warning: Embedding file not found: {embedding_file}")
             error_count += 1
             continue
 
-        try:
-            # Load embedding
-            embedding = np.load(embedding_file)
 
-            # Get tags for this video (empty list if not provided)
-            video_tags = tags_mapping.get(video_name, [])
+        # Load embedding
+        embedding = np.load(embedding_file)
+        print(embedding)
 
-            # Get duration if available
-            duration = video_info.get("duration", 0.0)
+        # Get tags for this video (empty list if not provided)
+        video_tags = tags_mapping.get(video_name, [])
 
-            # Get source path
-            source_path = video_info.get("source_path", "")
+        # Get duration if available
+        duration = video_info.get("duration", 0.0)
 
-            # Upsert to Qdrant
-            segment_id = f"{video_name}_seg_0"
-            store.upsert(
-                collection=args.collection,
-                segment_id=segment_id,
-                embedding=embedding.tolist(),
-                video_id=video_name,
-                tags=video_tags,
-                duration=duration,
-                segment_index=0,
-                source_path=source_path,
-            )
+        # Get source path
+        source_path = video_info.get("source_path", "")
 
-            tag_count = len(video_tags)
-            print(f"  Upserted: {video_name} ({tag_count} tags)")
-            success_count += 1
+        # Upsert to Qdrant
+        segment_id = f"{video_name}_seg_0"
+        store.upsert(
+            collection=args.collection,
+            segment_id=segment_id,
+            embedding=embedding.tolist(),
+            video_id=video_name,
+            tags=video_tags,
+            duration=duration,
+            segment_index=0,
+            source_path=source_path,
+        )
 
-        except Exception as e:
-            print(f"  Error processing {video_name}: {e}")
-            error_count += 1
-            continue
+        tag_count = len(video_tags)
+        print(f"  Upserted: {video_name} ({tag_count} tags)")
+        success_count += 1
+
 
     # Summary
     print()
-    print(f"Done! Upserted {success_count} videos, {error_count} errors")
     print(f"Total segments in collection: {store.count(args.collection)}")
 
 

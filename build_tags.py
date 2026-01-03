@@ -311,10 +311,11 @@ def process_videos_parallel(
 
     print(f"\nChecking video durations...")
     for video_file in sorted(video_files):
-        duration = get_video_duration(str(video_file))
-        if duration < min_duration:
-            skipped += 1
-            continue
+        if min_duration > 0:
+            duration = get_video_duration(str(video_file))
+            if duration < min_duration:
+                skipped += 1
+                continue
         work_items.append((
             str(video_file),
             known_encodings,
