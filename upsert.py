@@ -7,6 +7,7 @@ This script reads pre-computed embeddings (from preprocess.py) and tags
 
 Usage:
     python upsert.py ./embeddings --collection my_project --tags-file tags.json
+    python upsert.py ./embeddings --collection my_project --purge  # Purge before upsert
 """
 
 import argparse
@@ -39,6 +40,11 @@ def main():
         "--server-url",
         default="http://localhost:8004",
         help="Video embedding server URL (default: http://localhost:8004)",
+    )
+    parser.add_argument(
+        "--purge",
+        action="store_true",
+        help="Purge the collection (Qdrant + MinIO) before upserting",
     )
 
     args = parser.parse_args()
@@ -82,6 +88,22 @@ def main():
     server_url = args.server_url.rstrip("/")
     upsert_url = f"{server_url}/upsert"
     print(f"Using server: {server_url}")
+
+    # Purge collection if requested
+    if args.purge:
+        purge_url = f"{server_url}/collections/{args.collection}/purge"
+        print(f"Purging collection '{args.collection}'...")
+        try:
+            response = requests.delete(purge_url)
+            if response.status_code == 200:
+                result = response.json()
+                print(f"  Purged {result['purged_segments']} segments, {result['deleted_files']} files")
+            elif response.status_code == 404:
+                print(f"  Collection '{args.collection}' does not exist yet, skipping purge")
+            else:
+                print(f"  Warning: Purge failed: {response.status_code} - {response.text}")
+        except requests.RequestException as e:
+            print(f"  Warning: Purge request failed: {e}")
 
     success_count = 0
     error_count = 0

@@ -194,6 +194,76 @@ class MinIOClient:
             ExpiresIn=expires_in,
         )
 
+    async def delete_object(self, key: str) -> None:
+        """
+        Delete a single object from MinIO.
+
+        Args:
+            key: Object key to delete
+        """
+        await self._ensure_bucket()
+
+        loop = asyncio.get_event_loop()
+        try:
+            await loop.run_in_executor(
+                None,
+                partial(self._client.delete_object, Bucket=self.bucket, Key=key)
+            )
+            print(f"Deleted object: {key}")
+        except ClientError as e:
+            if e.response.get("Error", {}).get("Code") != "NoSuchKey":
+                raise
+
+    async def delete_prefix(self, prefix: str) -> int:
+        """
+        Delete all objects under a prefix.
+
+        Args:
+            prefix: Prefix to match (e.g., "videos/my_collection/")
+
+        Returns:
+            Number of objects deleted
+        """
+        await self._ensure_bucket()
+
+        loop = asyncio.get_event_loop()
+
+        # List all objects with prefix
+        def _list_objects():
+            keys = []
+            paginator = self._client.get_paginator("list_objects_v2")
+            for page in paginator.paginate(Bucket=self.bucket, Prefix=prefix):
+                if "Contents" in page:
+                    for obj in page["Contents"]:
+                        keys.append(obj["Key"])
+            return keys
+
+        keys = await loop.run_in_executor(None, _list_objects)
+
+        if not keys:
+            return 0
+
+        # Delete objects in batches of 1000 (S3 limit)
+        deleted_count = 0
+        for i in range(0, len(keys), 1000):
+            batch = keys[i:i + 1000]
+            delete_request = {
+                "Objects": [{"Key": k} for k in batch],
+                "Quiet": True,
+            }
+            await loop.run_in_executor(
+                None,
+                partial(
+                    self._client.delete_objects,
+                    Bucket=self.bucket,
+                    Delete=delete_request,
+                )
+            )
+            deleted_count += len(batch)
+
+        print(f"Deleted {deleted_count} objects with prefix: {prefix}")
+        return deleted_count
+
     @staticmethod
     def _guess_content_type(filepath: str) -> Optional[str]:
         """Guess content type based on file extension."""
