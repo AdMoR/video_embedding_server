@@ -12,21 +12,18 @@ Output format (tags.json):
     ]
 }
 
-Identity configuration (identities.json):
-{
-    "fred": [
-        "/path/to/fred_1.jpeg",
-        "/path/to/fred_2.jpeg"
-    ],
-    "jamy": [
-        "/path/to/jamy_1.jpeg",
-        "/path/to/jamy_2.jpeg"
-    ]
-}
+Character identities are fetched from the Character API, which provides
+identity_images stored in MinIO (bucket: virtual_streamer).
 
 Usage:
-    python build_tags.py ./videos tags.json --identities identities.json
-    python build_tags.py ./videos tags.json --identities identities.json --workers 8
+    python build_tags.py ./videos tags.json --characters fred jamy
+    python build_tags.py ./videos tags.json --characters fred jamy --workers 8
+    python build_tags.py ./videos tags.json --characters fred --api-base http://localhost:8000
+
+Environment variables for MinIO:
+    MINIO_ENDPOINT: MinIO server URL (default: http://minio:9000)
+    MINIO_ACCESS_KEY: Access key (default: minioadmin)
+    MINIO_SECRET_KEY: Secret key (default: minioadmin)
 """
 
 import argparse
@@ -34,15 +31,154 @@ import json
 import multiprocessing as mp
 import os
 import subprocess
+import tempfile
 from functools import partial
 from pathlib import Path
 
+import boto3
 import cv2
 import face_recognition
 import numpy as np
+import requests
+from botocore.client import Config
+from botocore.exceptions import ClientError
 
 # Video extensions to look for
 VIDEO_EXTENSIONS = {".mp4", ".avi", ".mov", ".mkv", ".webm"}
+
+
+def get_minio_client(bucket: str = "virtual_streamer"):
+    """Create a sync MinIO (S3) client using environment variables.
+
+    Args:
+        bucket: Bucket name to use.
+
+    Returns:
+        Tuple of (boto3 S3 client, bucket name).
+    """
+    endpoint = os.environ.get("MINIO_ENDPOINT", "http://minio:9000")
+    access_key = os.environ.get("MINIO_ACCESS_KEY", "minioadmin")
+    secret_key = os.environ.get("MINIO_SECRET_KEY", "minioadmin")
+
+    client = boto3.client(
+        "s3",
+        endpoint_url=endpoint,
+        aws_access_key_id=access_key,
+        aws_secret_access_key=secret_key,
+        config=Config(signature_version="s3v4"),
+        region_name="us-east-1",
+    )
+    return client, bucket
+
+
+def download_from_minio(
+    object_path: str,
+    local_path: str,
+    bucket: str = "virtual_streamer",
+) -> bool:
+    """Download a file from MinIO to a local path.
+
+    Args:
+        object_path: Object key/path in MinIO.
+        local_path: Local file path to save to.
+        bucket: MinIO bucket name.
+
+    Returns:
+        True if download succeeded, False otherwise.
+    """
+    try:
+        client, bucket_name = get_minio_client(bucket)
+        client.download_file(bucket_name, object_path, local_path)
+        return True
+    except ClientError as e:
+        print(f"  Warning: Failed to download {object_path}: {e}")
+        return False
+
+
+def fetch_character(
+    character_id: str,
+    api_base: str = "http://localhost:8000",
+) -> dict | None:
+    """Fetch character data from the Character API.
+
+    Args:
+        character_id: Unique identifier for the character.
+        api_base: Base URL of the Character API.
+
+    Returns:
+        Character dict with identity_images, or None if not found.
+    """
+    url = f"{api_base}/api/v1/character/{character_id}"
+    try:
+        response = requests.get(url, timeout=10)
+        response.raise_for_status()
+        return response.json()
+    except requests.RequestException as e:
+        print(f"  Warning: Failed to fetch character {character_id}: {e}")
+        return None
+
+
+def load_identities_from_characters(
+    character_ids: list[str],
+    api_base: str = "http://localhost:8000",
+) -> tuple[list, list[str]]:
+    """Load face embeddings from Character API.
+
+    Fetches character data from the API and downloads identity images
+    from MinIO to generate face encodings.
+
+    Args:
+        character_ids: List of character IDs to load.
+        api_base: Base URL of the Character API.
+
+    Returns:
+        Tuple of (list of face encodings, list of names).
+    """
+    all_encodings = []
+    all_names = []
+
+    for character_id in character_ids:
+        print(f"  Fetching character: {character_id}")
+        character = fetch_character(character_id, api_base)
+
+        if not character:
+            print(f"  Warning: Character not found: {character_id}")
+            continue
+
+        identity_images = character.get("identity_images", [])
+        if not identity_images:
+            print(f"  Warning: No identity images for character: {character_id}")
+            continue
+
+        # Use character name if available, otherwise use character_id
+        name = character.get("video_search_tag") or character.get("name") or character_id
+
+        for image_path in identity_images:
+            # Download image from MinIO to temp file
+            with tempfile.NamedTemporaryFile(
+                suffix=Path(image_path).suffix, delete=False
+            ) as tmp_file:
+                tmp_path = tmp_file.name
+
+            try:
+                if not download_from_minio(image_path, tmp_path):
+                    continue
+
+                # Load and encode face
+                image = face_recognition.load_image_file(tmp_path)
+                encodings = face_recognition.face_encodings(image)
+
+                if encodings:
+                    all_encodings.append(encodings[0])
+                    all_names.append(name)
+                else:
+                    print(f"  Warning: No face found in: {image_path}")
+            finally:
+                # Clean up temp file
+                if os.path.exists(tmp_path):
+                    os.unlink(tmp_path)
+
+    return all_encodings, all_names
 
 
 def load_identities(identities_file: str) -> tuple[list, list[str]]:
@@ -426,10 +562,16 @@ def main():
         help="Output JSON file for tags (format for upsert.py)",
     )
     parser.add_argument(
-        "--identities",
-        "-i",
+        "--characters",
+        "-c",
+        nargs="+",
         required=True,
-        help="JSON file mapping identity names to reference images",
+        help="Character IDs to load from the Character API",
+    )
+    parser.add_argument(
+        "--api-base",
+        default="http://localhost:8000",
+        help="Character API base URL (default: http://localhost:8000)",
     )
     parser.add_argument(
         "--speed-up",
@@ -465,13 +607,12 @@ def main():
         print(f"Error: Videos folder does not exist: {videos_path}")
         return
 
-    if not os.path.exists(args.identities):
-        print(f"Error: Identities file does not exist: {args.identities}")
-        return
-
-    # Load known identities
-    print(f"Loading identities from: {args.identities}")
-    known_encodings, known_names = load_identities(args.identities)
+    # Load known identities from Character API
+    print(f"Loading identities from Character API: {args.api_base}")
+    print(f"Characters: {args.characters}")
+    known_encodings, known_names = load_identities_from_characters(
+        args.characters, args.api_base
+    )
 
     if not known_encodings:
         print("Error: No valid face encodings loaded")
