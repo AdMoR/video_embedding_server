@@ -131,6 +131,13 @@ def compute_video_embedding(video_path: str) -> np.ndarray:
     return np.array(video_embedding[0])  # Remove batch dim
 
 
+def get_video_duration(video_path: str) -> float:
+    """Get video duration in seconds using mediapy."""
+    meta = mediapy._get_video_metadata(video_path)
+    duration = meta.num_images / meta.fps
+    return duration
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Initialize model, MinIO, and connect to Qdrant on startup."""
@@ -392,6 +399,9 @@ async def upsert(
         minio_path = await minio_client.upload_file(temp_path, minio_key)
         logger.info(f"Uploaded video to MinIO: {minio_path}")
 
+        # Compute video duration
+        duration = get_video_duration(temp_path)
+
         # Upsert to Qdrant with MinIO path
         vector_store.upsert(
             collection=collection,
@@ -399,7 +409,7 @@ async def upsert(
             embedding=embedding_vector,
             video_id=video_id,
             tags=video_tags,
-            duration=0.0,  # Could be computed from video if needed
+            duration=duration,
             segment_index=0,
             source_path=minio_path,
         )
