@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import jax
@@ -62,6 +63,26 @@ def read_and_preprocess_video(
     return frames
 
 
+def preprocess_video_task(video_file: Path) -> tuple[str, np.ndarray | None, Path, str | None]:
+    """
+    Worker function to preprocess a single video (CPU-bound).
+    
+    Returns:
+        Tuple of (video_name, preprocessed_frames, video_path, error_message)
+        If successful, error_message is None. If failed, frames is None.
+    """
+    video_name = video_file.stem
+    try:
+        frames = read_and_preprocess_video(
+            str(video_file),
+            target_num_frames=NUM_FRAMES,
+            target_frame_size=(FRAME_SIZE, FRAME_SIZE),
+        )
+        return (video_name, frames, video_file, None)
+    except Exception as e:
+        return (video_name, None, video_file, str(e))
+
+
 def load_model():
     """Load the VideoPrism model."""
     print(f"Loading model: {MODEL_NAME}")
@@ -107,8 +128,16 @@ def preprocess_folder(
     flax_model,
     loaded_state,
     text_tokenizer,
+    batch_size: int = 1,
 ):
-    """Process all videos in a folder and save embeddings."""
+    """Process all videos in a folder and save embeddings.
+    
+    Uses parallel CPU preprocessing with batched GPU inference to maximize
+    throughput while staying within VRAM limits.
+    
+    Args:
+        batch_size: Number of videos to process in a single GPU forward pass.
+    """
     input_path = Path(input_folder)
     output_path = Path(output_folder)
     output_path.mkdir(parents=True, exist_ok=True)
@@ -124,6 +153,12 @@ def preprocess_folder(
             train=train,
         )
 
+    # Prepare dummy text inputs once (reused for all videos)
+    dummy_text = ["dummy"]
+    text_ids, text_paddings = vp.tokenize_texts(text_tokenizer, dummy_text)
+    if USE_BFLOAT16:
+        text_paddings = text_paddings.astype(jnp.bfloat16)
+
     # Find all video files
     video_files = []
     for ext in VIDEO_EXTENSIONS:
@@ -134,38 +169,104 @@ def preprocess_folder(
         print(f"No video files found in {input_folder}")
         return
 
-    print(f"Found {len(video_files)} video(s) to process")
-
-    # Process each video
+    # Filter out videos that already have embeddings
+    videos_to_process = []
     metadata = {}
-    for i, video_file in enumerate(video_files, 1):
+    for video_file in video_files:
         video_name = video_file.stem
-        print(f"[{i}/{len(video_files)}] Processing: {video_file.name}")
         embedding_file = output_path / f"{video_name}.npy"
-        try:
-            if not embedding_file.exists():
-                embedding = compute_video_embedding(
-                    str(video_file),
-                    flax_model,
-                    loaded_state,
-                    text_tokenizer,
-                    forward_fn,
-                )
-                #print(embedding)
-                # Save embedding as .npy file
-                np.save(embedding_file, embedding)
-
-            # Track metadata
+        if embedding_file.exists():
+            # Already processed, just add to metadata
             metadata[video_name] = {
                 "source_path": str(video_file.absolute()),
                 "embedding_file": str(embedding_file.name),
             }
+            print(f"Skipping (already exists): {video_file.name}")
+        else:
+            videos_to_process.append(video_file)
 
-            print(f"  Saved: {embedding_file.name} ")
+    if not videos_to_process:
+        print("All videos already processed")
+        return
 
+    print(f"Found {len(video_files)} video(s), {len(videos_to_process)} to process")
+
+    # Determine number of workers (conservative to avoid memory pressure)
+    num_workers = max(2, (os.cpu_count() or 4) // 2)
+    print(f"Using {num_workers} CPU workers for parallel preprocessing")
+    print(f"GPU batch size: {batch_size}")
+
+    def run_batched_inference(batch_items: list[tuple[str, np.ndarray, Path]]):
+        """Run GPU inference on a batch of preprocessed videos."""
+        if not batch_items:
+            return
+        
+        video_names = [item[0] for item in batch_items]
+        frames_list = [item[1] for item in batch_items]
+        video_files = [item[2] for item in batch_items]
+        
+        try:
+            # Stack frames into a batch
+            batched_frames = np.stack(frames_list, axis=0)
+            jax_frames = jnp.asarray(batched_frames)
+            if USE_BFLOAT16:
+                jax_frames = jax_frames.astype(jnp.bfloat16)
+
+            # Tile text inputs to match batch size
+            batch_text_ids = jnp.tile(text_ids, (len(batch_items), 1))
+            batch_text_paddings = jnp.tile(text_paddings, (len(batch_items), 1))
+
+            # Run batched inference
+            video_embeddings, _, _ = forward_fn(jax_frames, batch_text_ids, batch_text_paddings)
+            
+            # Save each embedding
+            for i, (video_name, video_file) in enumerate(zip(video_names, video_files)):
+                embedding = np.array(video_embeddings[i])
+                embedding_file = output_path / f"{video_name}.npy"
+                np.save(embedding_file, embedding)
+                
+                metadata[video_name] = {
+                    "source_path": str(video_file.absolute()),
+                    "embedding_file": str(embedding_file.name),
+                }
+                print(f"  Saved: {embedding_file.name}")
+                
         except Exception as e:
-            logging.error(f"  Error processing {video_file.name}: {e}", exc_info=True)
-            continue
+            logging.error(f"  Error during batched GPU inference: {e}", exc_info=True)
+
+    # Parallel CPU preprocessing with batched GPU inference
+    processed_count = 0
+    batch_buffer: list[tuple[str, np.ndarray, Path]] = []
+    
+    with ThreadPoolExecutor(max_workers=num_workers) as executor:
+        # Submit all preprocessing tasks
+        futures = {
+            executor.submit(preprocess_video_task, video_file): video_file
+            for video_file in videos_to_process
+        }
+
+        # Process as completed, batching for GPU inference
+        for future in as_completed(futures):
+            video_name, frames, video_file, error = future.result()
+            processed_count += 1
+            
+            if error is not None:
+                logging.error(f"[{processed_count}/{len(videos_to_process)}] Error preprocessing {video_file.name}: {error}")
+                continue
+
+            print(f"[{processed_count}/{len(videos_to_process)}] Preprocessed: {video_file.name}")
+            batch_buffer.append((video_name, frames, video_file))
+            
+            # Run inference when batch is full
+            if len(batch_buffer) >= batch_size:
+                print(f"  Running GPU inference on batch of {len(batch_buffer)} videos...")
+                run_batched_inference(batch_buffer)
+                batch_buffer = []
+
+    # Process remaining items in buffer
+    if batch_buffer:
+        print(f"  Running GPU inference on final batch of {len(batch_buffer)} videos...")
+        run_batched_inference(batch_buffer)
 
     # Save metadata
     metadata_file = output_path / "metadata.json"
@@ -198,11 +299,21 @@ def main():
         "output_folder",
         help="Folder to save embeddings",
     )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=1,
+        help="Number of videos to process in a single GPU forward pass (default: 1)",
+    )
 
     args = parser.parse_args()
 
     if not os.path.isdir(args.input_folder):
         print(f"Error: Input folder does not exist: {args.input_folder}")
+        sys.exit(1)
+
+    if args.batch_size < 1:
+        print(f"Error: Batch size must be at least 1")
         sys.exit(1)
 
     # Load model
@@ -215,6 +326,7 @@ def main():
         flax_model,
         loaded_state,
         text_tokenizer,
+        batch_size=args.batch_size,
     )
 
 
