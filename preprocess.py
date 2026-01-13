@@ -5,14 +5,16 @@ import argparse
 import json
 import logging
 import os
+import subprocess
 import sys
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import jax
 import jax.numpy as jnp
 import mediapy
 import numpy as np
+from tqdm import tqdm
 
 from videoprism import models as vp
 
@@ -26,10 +28,39 @@ MAX_VIDEO_DURATION_SECONDS = 30  # Skip videos longer than this to avoid OOM
 VIDEO_EXTENSIONS = {".mp4", ".avi", ".mov", ".mkv", ".webm"}
 
 
-def get_video_duration(filename: str) -> float:
-    """Get video duration in seconds."""
-    info = mediapy.read_video_info(filename)
-    return info.num_images / info.fps if info.fps > 0 else 0
+def get_video_duration_ffprobe(filename: str) -> float:
+    """Get video duration in seconds using ffprobe (much faster than mediapy)."""
+    try:
+        result = subprocess.run(
+            [
+                "ffprobe",
+                "-v", "error",
+                "-show_entries", "format=duration",
+                "-of", "default=noprint_wrappers=1:nokey=1",
+                filename,
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=10,  # Safety timeout
+            check=False,
+        )
+        if result.returncode == 0 and result.stdout:
+            return float(result.stdout.strip())
+        return 0.0
+    except (subprocess.TimeoutExpired, ValueError, subprocess.SubprocessError) as e:
+        logging.debug(f"ffprobe error for {filename}: {e}")
+        return 0.0
+
+
+def check_video_duration_task(video_file: Path) -> tuple[Path, float | None, str | None]:
+    """Worker function for duration checking with ffprobe (runs in separate process)."""
+    try:
+        duration = get_video_duration_ffprobe(str(video_file))
+        if duration <= 0:
+            return (video_file, None, "Invalid duration")
+        return (video_file, duration, None)
+    except Exception as e:
+        return (video_file, None, str(e))
 
 
 def read_and_preprocess_video(
@@ -90,6 +121,46 @@ def preprocess_video_task(video_file: Path) -> tuple[str, np.ndarray | None, Pat
         return (video_name, None, video_file, str(e))
 
 
+def save_job_state(
+    output_path: Path,
+    videos_to_process: list[Path],
+    processed_videos: set[str],
+    skipped_too_long: list[tuple[Path, float]],
+    metadata: dict,
+) -> None:
+    """Save job state for resuming."""
+    state_file = output_path / ".preprocess_state.json"
+    state = {
+        "videos_to_process": [str(v.absolute()) for v in videos_to_process],
+        "processed_videos": list(processed_videos),
+        "skipped_too_long": [(str(v.absolute()), d) for v, d in skipped_too_long],
+        "metadata": metadata,
+    }
+    with open(state_file, "w") as f:
+        json.dump(state, f, indent=2)
+
+
+def load_job_state(output_path: Path) -> tuple[list[Path], set[str], list[tuple[Path, float]], dict] | None:
+    """Load job state for resuming. Returns None if no state exists."""
+    state_file = output_path / ".preprocess_state.json"
+    if not state_file.exists():
+        return None
+    
+    try:
+        with open(state_file, "r") as f:
+            state = json.load(f)
+        
+        videos_to_process = [Path(v) for v in state["videos_to_process"]]
+        processed_videos = set(state["processed_videos"])
+        skipped_too_long = [(Path(v), d) for v, d in state["skipped_too_long"]]
+        metadata = state["metadata"]
+        
+        return videos_to_process, processed_videos, skipped_too_long, metadata
+    except Exception as e:
+        logging.warning(f"Error loading job state: {e}")
+        return None
+
+
 def load_model():
     """Load the VideoPrism model."""
     print(f"Loading model: {MODEL_NAME}")
@@ -136,6 +207,7 @@ def preprocess_folder(
     loaded_state,
     text_tokenizer,
     batch_size: int = 1,
+    resume: bool = False,
 ):
     """Process all videos in a folder and save embeddings.
     
@@ -144,10 +216,40 @@ def preprocess_folder(
     
     Args:
         batch_size: Number of videos to process in a single GPU forward pass.
+        resume: If True, resume from saved state if available.
     """
     input_path = Path(input_folder)
     output_path = Path(output_folder)
     output_path.mkdir(parents=True, exist_ok=True)
+    
+    # Try to resume from saved state
+    processed_videos: set[str] = set()
+    if resume:
+        state = load_job_state(output_path)
+        if state:
+            _, processed_videos, skipped_too_long_loaded, metadata_loaded = state
+            print(f"Resuming: Found {len(processed_videos)} already processed videos")
+            metadata = metadata_loaded
+            skipped_too_long = skipped_too_long_loaded
+        else:
+            metadata = {}
+            skipped_too_long: list[tuple[Path, float]] = []
+    else:
+        metadata = {}
+        skipped_too_long: list[tuple[Path, float]] = []
+    
+    # Also check for existing embedding files
+    for video_file in input_path.glob("*"):
+        if video_file.suffix.lower() in VIDEO_EXTENSIONS:
+            video_name = video_file.stem
+            embedding_file = output_path / f"{video_name}.npy"
+            if embedding_file.exists() and video_name not in processed_videos:
+                processed_videos.add(video_name)
+                if video_name not in metadata:
+                    metadata[video_name] = {
+                        "source_path": str(video_file.absolute()),
+                        "embedding_file": str(embedding_file.name),
+                    }
 
     # Create JIT-compiled forward function
     @jax.jit
@@ -176,37 +278,57 @@ def preprocess_folder(
         print(f"No video files found in {input_folder}")
         return
 
-    # Filter out videos that already have embeddings or are too long
-    videos_to_process = []
-    skipped_too_long: list[tuple[Path, float]] = []  # (path, duration)
-    metadata = {}
-    
+    # Filter out videos that already have embeddings
+    videos_to_check = []
     for video_file in video_files:
         video_name = video_file.stem
         embedding_file = output_path / f"{video_name}.npy"
         
-        if embedding_file.exists():
+        if embedding_file.exists() or video_name in processed_videos:
             # Already processed, just add to metadata
-            metadata[video_name] = {
-                "source_path": str(video_file.absolute()),
-                "embedding_file": str(embedding_file.name),
-            }
-            print(f"Skipping (already exists): {video_file.name}")
+            if video_name not in metadata:
+                metadata[video_name] = {
+                    "source_path": str(video_file.absolute()),
+                    "embedding_file": str(embedding_file.name),
+                }
         else:
-            # Check video duration
-            try:
-                duration = get_video_duration(str(video_file))
-                if duration > MAX_VIDEO_DURATION_SECONDS:
+            videos_to_check.append(video_file)
+
+    if not videos_to_check:
+        print("No videos to process")
+        if skipped_too_long:
+            print(f"\n{len(skipped_too_long)} video(s) were skipped due to duration > {MAX_VIDEO_DURATION_SECONDS}s")
+        return
+
+    # Parallel duration checking with progress bar
+    print(f"Checking duration for {len(videos_to_check)} videos using ffprobe...")
+    videos_to_process = []
+    duration_workers = min(64, os.cpu_count() * 8)
+    
+    with ProcessPoolExecutor(max_workers=duration_workers) as executor:
+        futures = {
+            executor.submit(check_video_duration_task, video_file): video_file
+            for video_file in videos_to_check
+        }
+        
+        with tqdm(total=len(videos_to_check), desc="Checking durations") as pbar:
+            for future in as_completed(futures):
+                video_file, duration, error = future.result()
+                pbar.update(1)
+                
+                if error:
+                    logging.error(f"Error reading video info for {video_file.name}: {error}")
+                    skipped_too_long.append((video_file, -1))
+                elif duration and duration > MAX_VIDEO_DURATION_SECONDS:
                     skipped_too_long.append((video_file, duration))
-                    print(f"Skipping (too long: {duration:.1f}s > {MAX_VIDEO_DURATION_SECONDS}s): {video_file.name}")
                 else:
                     videos_to_process.append(video_file)
-            except Exception as e:
-                logging.error(f"Error reading video info for {video_file.name}: {e}")
-                skipped_too_long.append((video_file, -1))
 
+    # Filter out already processed videos
+    videos_to_process = [v for v in videos_to_process if v.stem not in processed_videos]
+    
     if not videos_to_process:
-        print("No videos to process")
+        print("No videos to process after duration checks")
         if skipped_too_long:
             print(f"\n{len(skipped_too_long)} video(s) were skipped due to duration > {MAX_VIDEO_DURATION_SECONDS}s")
         return
@@ -260,9 +382,12 @@ def preprocess_folder(
 
     # Parallel CPU preprocessing with batched GPU inference
     # Limit in-flight tasks to max_preloaded to avoid RAM saturation
-    processed_count = 0
     batch_buffer: list[tuple[str, np.ndarray, Path]] = []
     video_iter = iter(videos_to_process)
+    remaining_videos = set(v.stem for v in videos_to_process)
+    
+    # Progress bar for GPU processing
+    gpu_pbar = tqdm(total=len(videos_to_process), desc="Processing videos", unit="video")
     
     with ThreadPoolExecutor(max_workers=num_workers) as executor:
         # Submit initial batch of tasks (up to max_preloaded)
@@ -276,23 +401,44 @@ def preprocess_folder(
         # Process as completed, submitting new tasks to maintain max_preloaded
         while pending_futures:
             # Wait for at least one future to complete
-            done_futures = set()
             for future in as_completed(pending_futures):
-                done_futures.add(future)
                 video_name, frames, video_file, error = future.result()
-                processed_count += 1
                 
                 if error is not None:
-                    logging.error(f"[{processed_count}/{len(videos_to_process)}] Error preprocessing {video_file.name}: {error}")
+                    logging.error(f"Error preprocessing {video_file.name}: {error}")
+                    processed_videos.add(video_name)
+                    remaining_videos.discard(video_name)
+                    gpu_pbar.update(1)
                 else:
-                    print(f"[{processed_count}/{len(videos_to_process)}] Preprocessed: {video_file.name}")
                     batch_buffer.append((video_name, frames, video_file))
                     
                     # Run inference when batch is full
                     if len(batch_buffer) >= batch_size:
-                        print(f"  Running GPU inference on batch of {len(batch_buffer)} videos...")
                         run_batched_inference(batch_buffer)
+                        # Update progress for all videos in batch
+                        for vname, _, _ in batch_buffer:
+                            processed_videos.add(vname)
+                            remaining_videos.discard(vname)
+                            gpu_pbar.update(1)
                         batch_buffer = []
+                        
+                        # Save state periodically (every 100 videos)
+                        if len(processed_videos) % 100 == 0:
+                            # Get remaining videos: those not yet saved (in remaining_videos, pending, or buffer)
+                            pending_video_stems = {v.stem for v in pending_futures.values()}
+                            buffer_video_stems = {vname for vname, _, _ in batch_buffer}
+                            all_remaining_stems = remaining_videos | pending_video_stems | buffer_video_stems
+                            remaining_list = [
+                                v for v in videos_to_process 
+                                if v.stem in all_remaining_stems
+                            ]
+                            save_job_state(
+                                output_path,
+                                remaining_list,
+                                processed_videos,
+                                skipped_too_long,
+                                metadata,
+                            )
                 
                 # Submit new task if there are more videos
                 try:
@@ -308,8 +454,22 @@ def preprocess_folder(
 
     # Process remaining items in buffer
     if batch_buffer:
-        print(f"  Running GPU inference on final batch of {len(batch_buffer)} videos...")
         run_batched_inference(batch_buffer)
+        for video_name, _, _ in batch_buffer:
+            processed_videos.add(video_name)
+            remaining_videos.discard(video_name)
+            gpu_pbar.update(1)
+    
+    gpu_pbar.close()
+    
+    # Final state save
+    save_job_state(
+        output_path,
+        [],
+        processed_videos,
+        skipped_too_long,
+        metadata,
+    )
 
     # Save metadata
     metadata_file = output_path / "metadata.json"
@@ -357,6 +517,11 @@ def main():
         default=1,
         help="Number of videos to process in a single GPU forward pass (default: 1)",
     )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Resume from saved state if available",
+    )
 
     args = parser.parse_args()
 
@@ -379,6 +544,7 @@ def main():
         loaded_state,
         text_tokenizer,
         batch_size=args.batch_size,
+        resume=args.resume,
     )
 
 
