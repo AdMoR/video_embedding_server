@@ -45,10 +45,14 @@ COPY pyproject.toml uv.lock ./
 RUN uv sync --frozen --no-install-project
 
 # Copy the rest of the application
-COPY . .
+COPY ./videoprism ./videoprism
+COPY server.py server.py
 
 # Install the project itself
 RUN uv sync --frozen
+
+
+COPY minio_client.py minio_client.py
 
 # Set environment variables for optimal GPU usage
 # Prevent TensorFlow from allocating all GPU memory at startup
