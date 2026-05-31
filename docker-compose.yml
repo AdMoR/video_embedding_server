@@ -51,6 +51,10 @@ services:
     
     environment:
       - NVIDIA_VISIBLE_DEVICES=all
+      # Select captioning backend: "chai" (Qwen3-VL-8B, int8) or "marlin" (Marlin-2B, bfloat16)
+      - CAPTION_BACKEND=chai
+      - CHAI_MODEL=chancharikm/CHAI_SFT_model_8b
+      - MARLIN_MODEL=NemoStation/Marlin-2B
       # HF token for the gated EmbeddingGemma model (if not pre-baked into the image)
       - HF_TOKEN=xxxx
       # Qdrant connection

@@ -1,8 +1,8 @@
 """FastAPI server for video caption-based similarity search.
 
-Videos are captioned with Marlin-2B; the caption text is embedded with
-EmbeddingGemma and stored in Qdrant. Search embeds the query the same way and
-does cosine similarity over the caption embeddings.
+Videos are captioned with the configured backend (CHAI or Marlin-2B); the
+caption text is embedded with EmbeddingGemma and stored in Qdrant. Search
+embeds the query the same way and does cosine similarity over the embeddings.
 """
 
 import json
@@ -21,7 +21,6 @@ from minio_client import MinIOClient
 from storage import EMBEDDING_DIM, VectorStore
 
 # Configuration
-MARLIN_MODEL = os.getenv("MARLIN_MODEL", "NemoStation/Marlin-2B")
 QDRANT_HOST = os.getenv("QDRANT_HOST", "qdrant_server")
 QDRANT_PORT = int(os.getenv("QDRANT_PORT", "6333"))
 PORT = int(os.getenv("PORT", "8004"))
@@ -67,7 +66,7 @@ def _save_upload_to_temp(file: UploadFile) -> tuple[str, str]:
 
     Returns (temp_path, temp_dir). Caller is responsible for cleanup.
     """
-    filename = file.filename or "video.mp4"
+    filename = Path(file.filename or "video.mp4").name  # basename only — avoids absolute-path injection via os.path.join
     file_ext = Path(filename).suffix.lower()
     if file_ext not in VIDEO_EXTENSIONS:
         raise HTTPException(
@@ -84,7 +83,7 @@ async def lifespan(app: FastAPI):
     """Initialize models, MinIO, and connect to Qdrant on startup."""
     global vector_store, minio_client
 
-    logger.info(f"Loading models: {MARLIN_MODEL} + EmbeddingGemma")
+    logger.info(f"Loading models: backend={captioner.active_backend()} + EmbeddingGemma")
     captioner.load_models()
     logger.info("Models loaded successfully")
 
@@ -106,7 +105,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Video Caption Search Server",
-    description="Search videos by caption similarity using Marlin-2B captions and EmbeddingGemma embeddings with tag filtering",
+    description="Search videos by caption similarity using EmbeddingGemma embeddings with tag filtering",
     lifespan=lifespan,
 )
 
@@ -148,6 +147,11 @@ class CaptionResponse(BaseModel):
     events: list[dict]
 
 
+class CustomCaptionResponse(BaseModel):
+    prompt: str
+    caption: str
+
+
 class FindResponse(BaseModel):
     raw: str
     span: list[float] | None = None
@@ -178,7 +182,7 @@ async def health():
     collections = vector_store.list_collections() if vector_store else []
     return {
         "status": "healthy",
-        "model": MARLIN_MODEL,
+        "model": captioner.active_backend(),
         "qdrant_host": QDRANT_HOST,
         "collections": collections,
     }
@@ -256,12 +260,12 @@ async def upsert(
 
     If embedding is provided, it is used directly (offline-precomputed path);
     pass the matching caption alongside it so it appears in search results.
-    Otherwise the video is captioned with Marlin and the caption is embedded.
+    Otherwise the video is captioned with the active backend and the caption is embedded.
     """
     global minio_client
 
     # Validate file extension
-    filename = file.filename or "video.mp4"
+    filename = Path(file.filename or "video.mp4").name
     file_ext = Path(filename).suffix.lower()
     if file_ext not in VIDEO_EXTENSIONS:
         raise HTTPException(
@@ -396,6 +400,28 @@ async def caption_video(
             scene=cap.get("scene"),
             events=cap.get("events") or [],
         )
+    finally:
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
+        if os.path.exists(temp_dir):
+            os.rmdir(temp_dir)
+
+
+@app.post("/caption/custom", response_model=CustomCaptionResponse)
+async def caption_custom(
+    file: UploadFile = File(..., description="Video file to caption"),
+    prompt: str = Form(..., description="Custom prompt to pass to the model"),
+    max_new_tokens: int = Form(512, description="Maximum tokens to generate"),
+):
+    """Caption a video with a custom user-supplied prompt (for prompt experimentation)."""
+    temp_path, temp_dir = _save_upload_to_temp(file)
+    try:
+        content = await file.read()
+        with open(temp_path, "wb") as f:
+            f.write(content)
+
+        result = captioner.caption_with_prompt(temp_path, prompt=prompt, max_new_tokens=max_new_tokens)
+        return CustomCaptionResponse(prompt=prompt, caption=result)
     finally:
         if os.path.exists(temp_path):
             os.remove(temp_path)

@@ -19,6 +19,7 @@ from pathlib import Path
 import numpy as np
 from tqdm import tqdm
 
+sys.path.insert(0, str(Path(__file__).parent.parent))
 import captioner
 
 # Configuration

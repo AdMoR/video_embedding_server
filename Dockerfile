@@ -1,5 +1,5 @@
 # Dockerfile for the Video Caption Search Server with GPU Support
-# Marlin-2B (captioning) + EmbeddingGemma (text embeddings), PyTorch stack.
+# Supports CHAI (Qwen3-VL-8B, int8) and Marlin-2B captioning backends + EmbeddingGemma.
 # Uses NVIDIA CUDA base image with uv for fast, reproducible dependency management
 
 FROM nvidia/cuda:12.6.2-cudnn-devel-ubuntu22.04
@@ -46,19 +46,21 @@ COPY pyproject.toml uv.lock ./
 RUN uv sync --frozen --no-install-project
 
 # Copy the application
+COPY base_captioner.py base_captioner.py
+COPY chai_captioner.py chai_captioner.py
+COPY marlin_captioner.py marlin_captioner.py
 COPY captioner.py captioner.py
 COPY server.py server.py
 COPY storage.py storage.py
 COPY minio_client.py minio_client.py
-COPY preprocess.py preprocess.py
-COPY upsert.py upsert.py
-COPY batch_upsert.py batch_upsert.py
-COPY client.py client.py
 
 # Install the project itself
 RUN uv sync --frozen
 
-# Marlin-2B video preprocessing settings (match the training-time setup)
+# Default captioning backend ("chai" or "marlin" — overridable at runtime via docker-compose)
+ENV CAPTION_BACKEND=chai
+
+# Video preprocessing settings shared by both backends (match training-time setup)
 ENV FORCE_QWENVL_VIDEO_READER=torchcodec
 ENV VIDEO_MAX_PIXELS=200704
 ENV FPS=2.0
