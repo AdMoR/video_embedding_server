@@ -1,157 +1,92 @@
-"""FastAPI server for video embedding similarity queries."""
+"""FastAPI server for video caption-based similarity search.
+
+Videos are captioned with Marlin-2B; the caption text is embedded with
+EmbeddingGemma and stored in Qdrant. Search embeds the query the same way and
+does cosine similarity over the caption embeddings.
+"""
 
 import json
 import logging
 import os
+import subprocess
 import tempfile
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-import jax
-import jax.numpy as jnp
-import mediapy
-import numpy as np
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from pydantic import BaseModel
 
+import captioner
 from minio_client import MinIOClient
-from storage import VectorStore
-from videoprism import models as vp
+from storage import EMBEDDING_DIM, VectorStore
 
 # Configuration
-MODEL_NAME = os.getenv("MODEL_NAME", "videoprism_lvt_public_v1_base")
-QDRANT_HOST = os.getenv("QDRANT_HOST", "localhost")
+MARLIN_MODEL = os.getenv("MARLIN_MODEL", "NemoStation/Marlin-2B")
+QDRANT_HOST = os.getenv("QDRANT_HOST", "qdrant_server")
 QDRANT_PORT = int(os.getenv("QDRANT_PORT", "6333"))
+PORT = int(os.getenv("PORT", "8004"))
 
-NUM_FRAMES = 16
-FRAME_SIZE = 288
-USE_BFLOAT16 = False
 DEFAULT_TOP_K = 5
-DEFAULT_PROMPT_TEMPLATE = "a video of {}."
 
 VIDEO_EXTENSIONS = {".mp4", ".avi", ".mov", ".mkv", ".webm"}
 
 # Global state
-flax_model = None
-loaded_state = None
-text_tokenizer = None
 vector_store: VectorStore | None = None
 minio_client: MinIOClient | None = None
-cached_dummy_frames = None  # Cached dummy frames for text embedding computation
 
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
 
-@jax.jit
-def forward_fn(inputs, text_token_ids, text_paddings, train=False):
-    """JIT-compiled forward pass."""
-    return flax_model.apply(
-        loaded_state,
-        inputs,
-        text_token_ids,
-        text_paddings,
-        train=train,
-    )
-
-
-def create_dummy_frames():
-    """Create and cache dummy frames for text embedding computation."""
-    global cached_dummy_frames
-
-    # Create random dummy frames (the video content doesn't affect text embeddings)
-    dummy_frames = np.random.rand(NUM_FRAMES, FRAME_SIZE, FRAME_SIZE, 3).astype(
-        np.float32
-    )
-    dummy_frames = jnp.asarray(dummy_frames[None, ...])  # Add batch dimension
-    if USE_BFLOAT16:
-        dummy_frames = dummy_frames.astype(jnp.bfloat16)
-
-    cached_dummy_frames = dummy_frames
-    logger.info("Created cached dummy frames for text embedding computation")
-
-
-def read_and_preprocess_video(
-    filename: str, target_num_frames: int, target_frame_size: tuple[int, int]
-):
-    """Reads and preprocesses a video for embedding computation."""
-    frames = mediapy.read_video(filename)
-
-    # Sample to target number of frames
-    frame_indices = np.linspace(
-        0, len(frames), num=target_num_frames, endpoint=False, dtype=np.int32
-    )
-    frames = np.array([frames[i] for i in frame_indices])
-
-    # Resize to target size
-    original_height, original_width = frames.shape[-3:-1]
-    target_height, target_width = target_frame_size
-    if original_height * target_width != original_width * target_height:
-        # Center crop to target aspect ratio
-        target_ratio = target_width / target_height
-        original_ratio = original_width / original_height
-        if original_ratio > target_ratio:
-            # Crop width
-            new_width = int(original_height * target_ratio)
-            start = (original_width - new_width) // 2
-            frames = frames[:, :, start : start + new_width, :]
-        else:
-            # Crop height
-            new_height = int(original_width / target_ratio)
-            start = (original_height - new_height) // 2
-            frames = frames[:, start : start + new_height, :, :]
-
-    frames = mediapy.resize_video(frames, shape=target_frame_size)
-
-    # Normalize pixel values to [0.0, 1.0]
-    frames = mediapy.to_float01(frames)
-
-    return frames
-
-
-def compute_video_embedding(video_path: str) -> np.ndarray:
-    """Compute embedding for a single video file."""
-    frames = read_and_preprocess_video(
-        video_path,
-        target_num_frames=NUM_FRAMES,
-        target_frame_size=(FRAME_SIZE, FRAME_SIZE),
-    )
-    frames = jnp.asarray(frames[None, ...])  # Add batch dimension
-    if USE_BFLOAT16:
-        frames = frames.astype(jnp.bfloat16)
-
-    # Compute video embedding (need dummy text for forward pass)
-    dummy_text = ["dummy"]
-    text_ids, text_paddings = vp.tokenize_texts(text_tokenizer, dummy_text)
-    if USE_BFLOAT16:
-        text_paddings = text_paddings.astype(jnp.bfloat16)
-
-    video_embedding, _, _ = forward_fn(frames, text_ids, text_paddings)
-    return np.array(video_embedding[0])  # Remove batch dim
-
-
 def get_video_duration(video_path: str) -> float:
-    """Get video duration in seconds using mediapy."""
-    meta = mediapy._get_video_metadata(video_path)
-    duration = meta.num_images / meta.fps
-    return duration
+    """Get video duration in seconds using ffprobe."""
+    try:
+        result = subprocess.run(
+            [
+                "ffprobe",
+                "-v", "error",
+                "-show_entries", "format=duration",
+                "-of", "default=noprint_wrappers=1:nokey=1",
+                video_path,
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=10,
+            check=False,
+        )
+        if result.returncode == 0 and result.stdout:
+            return float(result.stdout.strip())
+    except (subprocess.TimeoutExpired, ValueError, subprocess.SubprocessError) as e:
+        logger.debug(f"ffprobe error for {video_path}: {e}")
+    return 0.0
+
+
+def _save_upload_to_temp(file: UploadFile) -> tuple[str, str]:
+    """Validate extension and write an uploaded file to a temp path.
+
+    Returns (temp_path, temp_dir). Caller is responsible for cleanup.
+    """
+    filename = file.filename or "video.mp4"
+    file_ext = Path(filename).suffix.lower()
+    if file_ext not in VIDEO_EXTENSIONS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid file extension '{file_ext}'. Allowed: {VIDEO_EXTENSIONS}",
+        )
+    temp_dir = tempfile.mkdtemp()
+    temp_path = os.path.join(temp_dir, filename)
+    return temp_path, temp_dir
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Initialize model, MinIO, and connect to Qdrant on startup."""
-    global flax_model, loaded_state, text_tokenizer, vector_store, minio_client
+    """Initialize models, MinIO, and connect to Qdrant on startup."""
+    global vector_store, minio_client
 
-    logger.info(f"Loading model: {MODEL_NAME}")
-    fprop_dtype = jnp.bfloat16 if USE_BFLOAT16 else None
-    flax_model = vp.get_model(MODEL_NAME, fprop_dtype=fprop_dtype)
-    loaded_state = vp.load_pretrained_weights(MODEL_NAME)
-    text_tokenizer = vp.load_text_tokenizer("c4_en")
-    logger.info("Model loaded successfully")
-
-    # Create dummy frames for text embedding computation
-    create_dummy_frames()
+    logger.info(f"Loading models: {MARLIN_MODEL} + EmbeddingGemma")
+    captioner.load_models()
+    logger.info("Models loaded successfully")
 
     # Connect to Qdrant
     logger.info(f"Connecting to Qdrant at {QDRANT_HOST}:{QDRANT_PORT}")
@@ -170,8 +105,8 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(
-    title="Video Embedding Similarity Server",
-    description="Search videos by text similarity using VideoPrism embeddings with tag filtering",
+    title="Video Caption Search Server",
+    description="Search videos by caption similarity using Marlin-2B captions and EmbeddingGemma embeddings with tag filtering",
     lifespan=lifespan,
 )
 
@@ -187,7 +122,6 @@ class SearchRequest(BaseModel):
     query: str
     collection: str
     top_k: int = DEFAULT_TOP_K
-    prompt_template: str = DEFAULT_PROMPT_TEMPLATE
     tags: list[str] | None = None
     tag_mode: str = "all"  # "all" (AND) or "any" (OR)
 
@@ -200,10 +134,24 @@ class SearchResult(BaseModel):
     path: str
     tags: list[TagInfo]
     similarity: float
+    caption: str | None = None
+    scene: str | None = None
 
 
 class SearchResponse(BaseModel):
     results: list[SearchResult]
+
+
+class CaptionResponse(BaseModel):
+    caption: str
+    scene: str | None = None
+    events: list[dict]
+
+
+class FindResponse(BaseModel):
+    raw: str
+    span: list[float] | None = None
+    format_ok: bool
 
 
 class UpsertResponse(BaseModel):
@@ -230,7 +178,7 @@ async def health():
     collections = vector_store.list_collections() if vector_store else []
     return {
         "status": "healthy",
-        "model": MODEL_NAME,
+        "model": MARLIN_MODEL,
         "qdrant_host": QDRANT_HOST,
         "collections": collections,
     }
@@ -253,8 +201,6 @@ async def list_tags(collection: str):
 @app.post("/search", response_model=SearchResponse)
 async def search(request: SearchRequest):
     """Search for videos matching the text query with optional tag filtering."""
-    global cached_dummy_frames
-
     # Validate collection exists
     if request.collection not in vector_store.list_collections():
         raise HTTPException(
@@ -267,22 +213,13 @@ async def search(request: SearchRequest):
             status_code=400, detail="tag_mode must be 'all' or 'any'"
         )
 
-    # Apply prompt template
-    text_query = request.prompt_template.format(request.query)
-
-    # Tokenize the text query
-    text_ids, text_paddings = vp.tokenize_texts(text_tokenizer, [text_query])
-    if USE_BFLOAT16:
-        text_paddings = text_paddings.astype(jnp.bfloat16)
-
-    # Get text embedding using dummy frames
-    _, text_embedding, _ = forward_fn(cached_dummy_frames, text_ids, text_paddings)
-    text_embedding = np.array(text_embedding[0])  # Remove batch dim
+    # Embed the query with EmbeddingGemma's query prompt
+    query_embedding = captioner.embed_query(request.query)
 
     # Search with tag filtering
     results = vector_store.search(
         collection=request.collection,
-        query_embedding=text_embedding.tolist(),
+        query_embedding=query_embedding,
         top_k=request.top_k,
         tags=request.tags,
         tag_mode=request.tag_mode,
@@ -298,6 +235,8 @@ async def search(request: SearchRequest):
                 path=r["source_path"],
                 tags=[TagInfo(**t) for t in r["tags"]],
                 similarity=r["score"],
+                caption=r.get("caption"),
+                scene=r.get("scene"),
             )
             for r in results
         ]
@@ -309,13 +248,15 @@ async def upsert(
     file: UploadFile = File(..., description="Video file to upload"),
     collection: str = Form(..., description="Qdrant collection name"),
     tags: str | None = Form(None, description="JSON string of tags array"),
-    embedding: str | None = Form(None, description="JSON string of embedding vector (768 floats)"),
+    embedding: str | None = Form(None, description=f"JSON string of embedding vector ({EMBEDDING_DIM} floats)"),
+    caption: str | None = Form(None, description="Precomputed caption text (used with embedding)"),
 ):
     """
-    Upload a video to MinIO and upsert its embedding to Qdrant.
+    Upload a video to MinIO and upsert its caption embedding to Qdrant.
 
-    If embedding is provided, it will be used directly.
-    Otherwise, the embedding will be computed from the video.
+    If embedding is provided, it is used directly (offline-precomputed path);
+    pass the matching caption alongside it so it appears in search results.
+    Otherwise the video is captioned with Marlin and the caption is embedded.
     """
     global minio_client
 
@@ -339,14 +280,17 @@ async def upsert(
             f.write(content)
 
         # Get or compute embedding
+        caption_text = caption or ""
+        scene_text = ""
+        events: list[dict] = []
         if embedding:
-            # Parse provided embedding
+            # Parse provided embedding (offline-precomputed path)
             try:
                 embedding_vector = json.loads(embedding)
-                if not isinstance(embedding_vector, list) or len(embedding_vector) != 768:
+                if not isinstance(embedding_vector, list) or len(embedding_vector) != EMBEDDING_DIM:
                     raise HTTPException(
                         status_code=400,
-                        detail="Embedding must be a JSON array of 768 floats",
+                        detail=f"Embedding must be a JSON array of {EMBEDDING_DIM} floats",
                     )
             except json.JSONDecodeError as e:
                 raise HTTPException(
@@ -355,10 +299,13 @@ async def upsert(
                 )
             logger.info(f"Using provided embedding for {filename}")
         else:
-            # Compute embedding from video
-            logger.info(f"Computing embedding for {filename}")
-            embedding_array = compute_video_embedding(temp_path)
-            embedding_vector = embedding_array.tolist()
+            # Caption the video and embed the caption text
+            logger.info(f"Captioning {filename}")
+            cap = captioner.caption(temp_path)
+            caption_text = cap["caption"]
+            scene_text = cap.get("scene") or ""
+            events = cap.get("events") or []
+            embedding_vector = captioner.embed_document(caption_text)
 
         # Parse tags if provided
         video_tags = []
@@ -412,6 +359,9 @@ async def upsert(
             duration=duration,
             segment_index=0,
             source_path=minio_path,
+            caption=caption_text,
+            scene=scene_text,
+            events=events,
         )
         logger.info(f"Upserted {segment_id} to collection {collection}")
 
@@ -423,6 +373,56 @@ async def upsert(
 
     finally:
         # Clean up temp file
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
+        if os.path.exists(temp_dir):
+            os.rmdir(temp_dir)
+
+
+@app.post("/caption", response_model=CaptionResponse)
+async def caption_video(
+    file: UploadFile = File(..., description="Video file to caption"),
+):
+    """Generate a dense caption (scene + timed events) for an uploaded video."""
+    temp_path, temp_dir = _save_upload_to_temp(file)
+    try:
+        content = await file.read()
+        with open(temp_path, "wb") as f:
+            f.write(content)
+
+        cap = captioner.caption(temp_path)
+        return CaptionResponse(
+            caption=cap["caption"],
+            scene=cap.get("scene"),
+            events=cap.get("events") or [],
+        )
+    finally:
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
+        if os.path.exists(temp_dir):
+            os.rmdir(temp_dir)
+
+
+@app.post("/find", response_model=FindResponse)
+async def find_event(
+    file: UploadFile = File(..., description="Video file to search within"),
+    event: str = Form(..., description="Natural-language event to locate"),
+):
+    """Temporally locate a natural-language event within an uploaded video."""
+    temp_path, temp_dir = _save_upload_to_temp(file)
+    try:
+        content = await file.read()
+        with open(temp_path, "wb") as f:
+            f.write(content)
+
+        res = captioner.find(temp_path, event=event)
+        span = res.get("span")
+        return FindResponse(
+            raw=res.get("raw", ""),
+            span=list(span) if span else None,
+            format_ok=res.get("format_ok", False),
+        )
+    finally:
         if os.path.exists(temp_path):
             os.remove(temp_path)
         if os.path.exists(temp_dir):
@@ -513,4 +513,4 @@ async def purge_collection(collection: str):
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run(app, host="0.0.0.0", port=8004)
+    uvicorn.run(app, host="0.0.0.0", port=PORT)

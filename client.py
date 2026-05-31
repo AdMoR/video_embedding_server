@@ -12,7 +12,6 @@ def search(
     collection: str,
     server_url: str = "http://localhost:8000",
     top_k: int = 5,
-    prompt_template: str = "a video of {}.",
     tags: list[str] | None = None,
     tag_mode: str = "all",
 ) -> dict:
@@ -23,7 +22,6 @@ def search(
         collection: The Qdrant collection to search in.
         server_url: The base URL of the server.
         top_k: Number of top results to return.
-        prompt_template: Template to wrap the query (use {} as placeholder).
         tags: Optional list of tags to filter by.
         tag_mode: Tag filter mode - "all" (AND) or "any" (OR).
 
@@ -34,7 +32,6 @@ def search(
         "query": query,
         "collection": collection,
         "top_k": top_k,
-        "prompt_template": prompt_template,
     }
     if tags:
         payload["tags"] = tags
@@ -112,12 +109,6 @@ def main():
         help="Number of results to return (default: 5)",
     )
     parser.add_argument(
-        "--template",
-        "-t",
-        default="a video of {}.",
-        help="Prompt template (default: 'a video of {}.')",
-    )
-    parser.add_argument(
         "--tags",
         nargs="*",
         help="Filter by tags (space-separated)",
@@ -179,7 +170,6 @@ def main():
                 collection=args.collection,
                 server_url=args.server,
                 top_k=args.top_k,
-                prompt_template=args.template,
                 tags=args.tags,
                 tag_mode=args.tag_mode,
             )

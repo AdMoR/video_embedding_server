@@ -60,3 +60,11 @@ docs/
 .DS_Store
 *.log
 
+# Large data / local artifacts (not needed in the image)
+CPS.json
+friends_id_tags.json
+identities.json
+data/
+assets/
+*.npy
+

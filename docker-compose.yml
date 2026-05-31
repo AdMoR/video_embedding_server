@@ -1,23 +1,39 @@
-version: '3.8'
-
 services:
-  qdrant:
+  qdrant_server:
     image: qdrant/qdrant:latest
-    container_name: qdrant
+    container_name: qdrant_server
     ports:
       - "6333:6333"
     volumes:
       - qdrant_data:/qdrant/storage
+
+  minio:
+    image: minio/minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
 
   video-embedding-server:
     build:
       context: .
       dockerfile: Dockerfile
     image: video-embedding-server:latest
-    container_name: video-embedding-server
+    container_name: video-embedding-server-gpu
     depends_on:
-      - qdrant
-    
+      - qdrant_server
+      - minio
+
     # GPU support - requires NVIDIA Container Toolkit
     # Install: https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html
     deploy:
@@ -35,17 +51,13 @@ services:
     
     environment:
       - NVIDIA_VISIBLE_DEVICES=all
-      - TF_FORCE_GPU_ALLOW_GROWTH=true
-      - XLA_PYTHON_CLIENT_MEM_FRACTION=0.9
-      # Uncomment to use pre-computed embeddings (faster startup)
-      - EMBEDDINGS_FOLDER=/app/data/embeddings
+      # HF token for the gated EmbeddingGemma model (if not pre-baked into the image)
+      - HF_TOKEN=xxxx
       # Qdrant connection
-      - QDRANT_HOST=qdrant
+      - QDRANT_HOST=qdrant_server
       - QDRANT_PORT=6333
     
     volumes:
-      # Mount for input videos (optional - adjust path as needed)
-      - /media/amor/data1/Downloads/CPS/fred_voice_clips_embeddings/:/app/data/embeddings
       # Mount for model cache (speeds up subsequent runs)
       - huggingface-cache:/root/.cache/huggingface
     
@@ -54,8 +66,24 @@ services:
     tty: true
     
     ports:
-      - "8000:8000"
+      - "8006:8004"
 
 volumes:
   huggingface-cache:
+    driver: local # Define the driver and options under the volume name
+    driver_opts:
+      type: none
+      device: /media/amor/data/virtual_streamer_folder/hf_cache
+      o: bind
   qdrant_data:
+    driver: local # Define the driver and options under the volume name
+    driver_opts:
+      type: none
+      device: /media/amor/data/virtual_streamer_folder/qdrant_storage
+      o: bind
+  minio_data:
+    driver: local # Define the driver and options under the volume name
+    driver_opts:
+      type: none
+      device: /media/amor/data/virtual_streamer_folder/storage
+      o: bind

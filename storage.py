@@ -51,6 +51,9 @@ class VectorStore:
         duration: float = 0.0,
         segment_index: int = 0,
         source_path: str = "",
+        caption: str = "",
+        scene: str = "",
+        events: list[dict] | None = None,
     ) -> None:
         """Insert or update a segment.
 
@@ -63,6 +66,9 @@ class VectorStore:
             duration: Total video duration in seconds.
             segment_index: Index of this segment within the video.
             source_path: Path to the source video file.
+            caption: Generated caption text for the video.
+            scene: Parsed scene paragraph from the caption.
+            events: List of dense event dicts with keys: start, end, description.
         """
         tag_names = [t["name"] for t in tags]
         self.client.upsert(
@@ -78,6 +84,9 @@ class VectorStore:
                         "source_path": source_path,
                         "tags": tags,
                         "tag_names": tag_names,
+                        "caption": caption,
+                        "scene": scene,
+                        "events": events or [],
                     },
                 )
             ],

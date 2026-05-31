@@ -1,4 +1,5 @@
-# Dockerfile for VideoPrism Video Embedding Server with GPU Support
+# Dockerfile for the Video Caption Search Server with GPU Support
+# Marlin-2B (captioning) + EmbeddingGemma (text embeddings), PyTorch stack.
 # Uses NVIDIA CUDA base image with uv for fast, reproducible dependency management
 
 FROM nvidia/cuda:12.6.2-cudnn-devel-ubuntu22.04
@@ -44,25 +45,33 @@ COPY pyproject.toml uv.lock ./
 # This layer is cached unless pyproject.toml or uv.lock changes
 RUN uv sync --frozen --no-install-project
 
-# Copy the rest of the application
-COPY ./videoprism ./videoprism
+# Copy the application
+COPY captioner.py captioner.py
 COPY server.py server.py
+COPY storage.py storage.py
+COPY minio_client.py minio_client.py
+COPY preprocess.py preprocess.py
+COPY upsert.py upsert.py
+COPY batch_upsert.py batch_upsert.py
+COPY client.py client.py
 
 # Install the project itself
 RUN uv sync --frozen
 
+# Marlin-2B video preprocessing settings (match the training-time setup)
+ENV FORCE_QWENVL_VIDEO_READER=torchcodec
+ENV VIDEO_MAX_PIXELS=200704
+ENV FPS=2.0
+ENV FPS_MAX_FRAMES=240
+ENV FPS_MIN_FRAMES=4
 
-COPY minio_client.py minio_client.py
-
-# Set environment variables for optimal GPU usage
-# Prevent TensorFlow from allocating all GPU memory at startup
-ENV TF_FORCE_GPU_ALLOW_GROWTH=true
-
-# JAX memory preallocation (90% leaves room for system/other processes)
-ENV XLA_PYTHON_CLIENT_MEM_FRACTION=0.9
-
-# Point XLA to system CUDA
-ENV XLA_FLAGS="--xla_gpu_cuda_data_dir=/usr/local/cuda"
+# Models are downloaded at runtime on first startup, not at build time.
+# They are cached in /root/.cache/huggingface, which is backed by the
+# huggingface-cache named volume defined in docker-compose.yml — so the
+# download only happens once and persists across container restarts.
+#
+# EmbeddingGemma is gated: accept the Gemma license on huggingface.co,
+# then pass HF_TOKEN via docker-compose.yml (already wired up).
 
 # Expose port for the API server
 EXPOSE 8004

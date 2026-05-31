@@ -38,8 +38,8 @@ def main():
     )
     parser.add_argument(
         "--server-url",
-        default="http://localhost:8004",
-        help="Video embedding server URL (default: http://localhost:8004)",
+        default="http://localhost:8000",
+        help="Video embedding server URL (default: http://localhost:8000)",
     )
     parser.add_argument(
         "--purge",
@@ -142,6 +142,10 @@ def main():
                     "embedding": json.dumps(embedding_list),
                     "tags": json.dumps(video_tags),
                 }
+                # Carry the precomputed caption so it shows up in search results
+                caption_text = video_info.get("caption")
+                if caption_text:
+                    data["caption"] = caption_text
 
                 response = requests.post(upsert_url, files=files, data=data)
 
