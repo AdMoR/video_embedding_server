@@ -27,6 +27,7 @@ dependencies = [
     "flash-linear-attention",
     "torchvision>=0.27.0",
     "bitsandbytes>=0.49.2",
+    "transcriber>=0.1.19",
 ]
 
 [project.optional-dependencies]

@@ -17,6 +17,7 @@ from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from pydantic import BaseModel
 
 import captioner
+import transcriber
 from minio_client import MinIOClient
 from storage import EMBEDDING_DIM, VectorStore
 
@@ -36,6 +37,26 @@ minio_client: MinIOClient | None = None
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
+
+
+def extract_audio(video_path: str, audio_path: str) -> bool:
+    """Extract mono 16 kHz WAV audio from a video for Whisper. Returns True on success."""
+    try:
+        result = subprocess.run(
+            [
+                "ffmpeg", "-i", video_path,
+                "-vn", "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1",
+                "-y", audio_path,
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=120,
+            check=False,
+        )
+        return result.returncode == 0
+    except (subprocess.TimeoutExpired, subprocess.SubprocessError) as e:
+        logger.debug(f"ffmpeg audio extraction error for {video_path}: {e}")
+        return False
 
 
 def get_video_duration(video_path: str) -> float:
@@ -125,6 +146,12 @@ class SearchRequest(BaseModel):
     tag_mode: str = "all"  # "all" (AND) or "any" (OR)
 
 
+class TranscriptionSegment(BaseModel):
+    start: float
+    end: float
+    text: str
+
+
 class SearchResult(BaseModel):
     segment_id: str
     video_id: str
@@ -135,6 +162,7 @@ class SearchResult(BaseModel):
     similarity: float
     caption: str | None = None
     scene: str | None = None
+    transcription: list[TranscriptionSegment] | None = None
 
 
 class SearchResponse(BaseModel):
@@ -241,6 +269,7 @@ async def search(request: SearchRequest):
                 similarity=r["score"],
                 caption=r.get("caption"),
                 scene=r.get("scene"),
+                transcription=[TranscriptionSegment(**s) for s in r.get("transcription") or []],
             )
             for r in results
         ]
@@ -282,6 +311,22 @@ async def upsert(
         content = await file.read()
         with open(temp_path, "wb") as f:
             f.write(content)
+
+        # Transcribe audio with Whisper
+        audio_path = os.path.join(temp_dir, "audio.wav")
+        whisper_segments: list[dict] = []
+        if extract_audio(temp_path, audio_path):
+            try:
+                logger.info(f"Transcribing audio for {filename}")
+                whisper_segments = transcriber.transcribe_with_timestamps(audio_path)
+                logger.info(f"Transcription done: {len(whisper_segments)} segments")
+            except Exception as e:
+                logger.warning(f"Transcription failed for {filename}: {e}")
+            finally:
+                if os.path.exists(audio_path):
+                    os.remove(audio_path)
+        else:
+            logger.info(f"No audio track found in {filename}, skipping transcription")
 
         # Get or compute embedding
         caption_text = caption or ""
@@ -366,6 +411,7 @@ async def upsert(
             caption=caption_text,
             scene=scene_text,
             events=events,
+            transcription=whisper_segments,
         )
         logger.info(f"Upserted {segment_id} to collection {collection}")
 

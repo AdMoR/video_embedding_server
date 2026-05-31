@@ -1,317 +1,386 @@
 #!/usr/bin/env python3
-"""Preprocess videos: caption with Marlin-2B and embed captions for faster indexing.
+"""Preprocess videos: scene-split, filter by duration, and upsert to server.
 
-For each video this saves a 768-d caption embedding (.npy) plus the caption text
-to metadata.json, which `upsert.py` then pushes to the server. Captioning runs on
-the GPU one video at a time (Marlin is not batched here), so this is a sequential
-loop; only the ffprobe duration pre-check is parallelised.
+Pipeline:
+  1. Split each source video into scenes with PySceneDetect (parallel, resumable).
+  2. Filter out scene chunks longer than --max-duration.
+  3. Upsert remaining chunks to the server in parallel (server handles captioning).
+
+Usage:
+    python scripts/preprocess.py /data/videos /data/chunks --collection my_col
+    python scripts/preprocess.py /data/videos /data/chunks --collection my_col --dry-run
+    python scripts/preprocess.py /data/videos /data/chunks --collection my_col --purge --workers 8
 """
 
 import argparse
 import json
 import logging
-import os
+import re
+import shutil
 import subprocess
 import sys
-from concurrent.futures import ProcessPoolExecutor, as_completed
+import tempfile
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
-import numpy as np
+import requests
 from tqdm import tqdm
 
-sys.path.insert(0, str(Path(__file__).parent.parent))
-import captioner
-
-# Configuration
-MARLIN_MODEL = os.getenv("MARLIN_MODEL", "NemoStation/Marlin-2B")
-TEXT_EMBED_MODEL = os.getenv("TEXT_EMBED_MODEL", "google/embeddinggemma-300m")
-MAX_VIDEO_DURATION_SECONDS = 20  # Skip videos longer than this to avoid OOM
-
 VIDEO_EXTENSIONS = {".mp4", ".avi", ".mov", ".mkv", ".webm"}
+SCENE_PATTERN = re.compile(r"^(.+)-Scene-\d+\.mp4$")
+
+logging.basicConfig(level=logging.WARNING, format="%(levelname)s: %(message)s")
+log = logging.getLogger(__name__)
 
 
-def get_video_duration_ffprobe(filename: str) -> float:
-    """Get video duration in seconds using ffprobe (much faster than decoding)."""
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def get_video_duration(path: Path) -> float:
+    """Return video duration in seconds via ffprobe, or 0 on failure."""
     try:
         result = subprocess.run(
             [
-                "ffprobe",
-                "-v", "error",
+                "ffprobe", "-v", "error",
                 "-show_entries", "format=duration",
                 "-of", "default=noprint_wrappers=1:nokey=1",
-                filename,
+                str(path),
             ],
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
-            timeout=10,  # Safety timeout
+            timeout=10,
             check=False,
         )
         if result.returncode == 0 and result.stdout:
             return float(result.stdout.strip())
-        return 0.0
-    except (subprocess.TimeoutExpired, ValueError, subprocess.SubprocessError) as e:
-        logging.debug(f"ffprobe error for {filename}: {e}")
-        return 0.0
+    except Exception:
+        pass
+    return 0.0
 
 
-def check_video_duration_task(video_file: Path) -> tuple[Path, float | None, str | None]:
-    """Worker function for duration checking with ffprobe (runs in separate process)."""
-    try:
-        duration = get_video_duration_ffprobe(str(video_file))
-        if duration <= 0:
-            return (video_file, None, "Invalid duration")
-        return (video_file, duration, None)
-    except Exception as e:
-        return (video_file, None, str(e))
+def get_processed_video_names(output_path: Path) -> set[str]:
+    """Return stems of source videos that already have scene chunks in output_path."""
+    processed = set()
+    for f in output_path.iterdir():
+        if f.is_file():
+            m = SCENE_PATTERN.match(f.name)
+            if m:
+                processed.add(m.group(1))
+    return processed
 
 
-def save_job_state(
+def sanitize_stem(stem: str) -> str:
+    """Replace characters that confuse ffmpeg/scenedetect (dots, spaces, etc.) with underscores."""
+    return re.sub(r'[^a-zA-Z0-9_\-]', '_', stem)
+
+
+def source_stem(chunk_stem: str) -> str:
+    """Extract source video stem from a scene chunk stem (strip -Scene-NNN suffix)."""
+    m = re.match(r"^(.+)-Scene-\d+$", chunk_stem)
+    return m.group(1) if m else chunk_stem
+
+
+def split_video(
+    video_file: Path,
     output_path: Path,
-    videos_to_process: list[Path],
-    processed_videos: set[str],
-    skipped_too_long: list[tuple[Path, float]],
-    metadata: dict,
-) -> None:
-    """Save job state for resuming."""
-    state_file = output_path / ".preprocess_state.json"
-    state = {
-        "videos_to_process": [str(v.absolute()) for v in videos_to_process],
-        "processed_videos": list(processed_videos),
-        "skipped_too_long": [(str(v.absolute()), d) for v, d in skipped_too_long],
-        "metadata": metadata,
-    }
-    with open(state_file, "w") as f:
-        json.dump(state, f, indent=2)
+    min_scene_len: float,
+) -> tuple[Path, bool, str]:
+    """Run scenedetect on a single video.
 
-
-def load_job_state(output_path: Path) -> tuple[list[Path], set[str], list[tuple[Path, float]], dict] | None:
-    """Load job state for resuming. Returns None if no state exists."""
-    state_file = output_path / ".preprocess_state.json"
-    if not state_file.exists():
-        return None
-
-    try:
-        with open(state_file, "r") as f:
-            state = json.load(f)
-
-        videos_to_process = [Path(v) for v in state["videos_to_process"]]
-        processed_videos = set(state["processed_videos"])
-        skipped_too_long = [(Path(v), d) for v, d in state["skipped_too_long"]]
-        metadata = state["metadata"]
-
-        return videos_to_process, processed_videos, skipped_too_long, metadata
-    except Exception as e:
-        logging.warning(f"Error loading job state: {e}")
-        return None
-
-
-def preprocess_folder(
-    input_folder: str,
-    output_folder: str,
-    resume: bool = False,
-):
-    """Caption all videos in a folder and save caption embeddings.
-
-    Args:
-        resume: If True, resume from saved state if available.
+    Copies the file to a temp path with a sanitized name first so that
+    dots (non-extension separators), spaces, and other special characters
+    don't confuse ffmpeg or scenedetect.
     """
-    input_path = Path(input_folder)
-    output_path = Path(output_folder)
-    output_path.mkdir(parents=True, exist_ok=True)
-
-    # Try to resume from saved state
-    processed_videos: set[str] = set()
-    if resume:
-        state = load_job_state(output_path)
-        if state:
-            _, processed_videos, skipped_too_long_loaded, metadata_loaded = state
-            print(f"Resuming: Found {len(processed_videos)} already processed videos")
-            metadata = metadata_loaded
-            skipped_too_long = skipped_too_long_loaded
+    safe_stem = sanitize_stem(video_file.stem)
+    temp_dir = None
+    try:
+        if safe_stem != video_file.stem:
+            temp_dir = tempfile.mkdtemp()
+            input_path = Path(temp_dir) / f"{safe_stem}{video_file.suffix}"
+            shutil.copy2(video_file, input_path)
         else:
-            metadata = {}
-            skipped_too_long: list[tuple[Path, float]] = []
-    else:
-        metadata = {}
-        skipped_too_long: list[tuple[Path, float]] = []
+            input_path = video_file
 
-    # Also check for existing embedding files
-    for video_file in input_path.glob("*"):
-        if video_file.suffix.lower() in VIDEO_EXTENSIONS:
-            video_name = video_file.stem
-            embedding_file = output_path / f"{video_name}.npy"
-            if embedding_file.exists() and video_name not in processed_videos:
-                processed_videos.add(video_name)
-                if video_name not in metadata:
-                    metadata[video_name] = {
-                        "source_path": str(video_file.absolute()),
-                        "embedding_file": str(embedding_file.name),
-                    }
-
-    # Find all video files
-    video_files = []
-    for ext in VIDEO_EXTENSIONS:
-        video_files.extend(input_path.glob(f"*{ext}"))
-        video_files.extend(input_path.glob(f"*{ext.upper()}"))
-
-    if not video_files:
-        print(f"No video files found in {input_folder}")
-        return
-
-    # Filter out videos that already have embeddings
-    videos_to_check = []
-    for video_file in video_files:
-        video_name = video_file.stem
-        embedding_file = output_path / f"{video_name}.npy"
-
-        if embedding_file.exists() or video_name in processed_videos:
-            # Already processed, just add to metadata
-            if video_name not in metadata:
-                metadata[video_name] = {
-                    "source_path": str(video_file.absolute()),
-                    "embedding_file": str(embedding_file.name),
-                }
-        else:
-            videos_to_check.append(video_file)
-
-    if not videos_to_check:
-        print("No videos to process")
-        if skipped_too_long:
-            print(f"\n{len(skipped_too_long)} video(s) were skipped due to duration > {MAX_VIDEO_DURATION_SECONDS}s")
-        return
-
-    # Parallel duration checking with progress bar (pure ffprobe, no GPU)
-    print(f"Checking duration for {len(videos_to_check)} videos using ffprobe...")
-    videos_to_process = []
-    duration_workers = min(64, (os.cpu_count() or 4) * 8)
-
-    with ProcessPoolExecutor(max_workers=duration_workers) as executor:
-        futures = {
-            executor.submit(check_video_duration_task, video_file): video_file
-            for video_file in videos_to_check
-        }
-
-        with tqdm(total=len(videos_to_check), desc="Checking durations") as pbar:
-            for future in as_completed(futures):
-                video_file, duration, error = future.result()
-                pbar.update(1)
-
-                if error:
-                    logging.error(f"Error reading video info for {video_file.name}: {error}")
-                    skipped_too_long.append((video_file, -1))
-                elif duration and duration > MAX_VIDEO_DURATION_SECONDS:
-                    skipped_too_long.append((video_file, duration))
-                else:
-                    videos_to_process.append(video_file)
-
-    # Filter out already processed videos
-    videos_to_process = [v for v in videos_to_process if v.stem not in processed_videos]
-
-    if not videos_to_process:
-        print("No videos to process after duration checks")
-        if skipped_too_long:
-            print(f"\n{len(skipped_too_long)} video(s) were skipped due to duration > {MAX_VIDEO_DURATION_SECONDS}s")
-        return
-
-    print(f"Found {len(video_files)} video(s), {len(videos_to_process)} to process, {len(skipped_too_long)} skipped (too long)")
-
-    # Load models once (Marlin + EmbeddingGemma on GPU)
-    print(f"Loading models: {MARLIN_MODEL} + {TEXT_EMBED_MODEL}")
-    captioner.load_models()
-    print("Models loaded successfully")
-
-    # Sequential captioning + embedding (one video at a time on the GPU)
-    pbar = tqdm(total=len(videos_to_process), desc="Captioning videos", unit="video")
-    for video_file in videos_to_process:
-        video_name = video_file.stem
-        try:
-            cap = captioner.caption(str(video_file))
-            caption_text = cap["caption"]
-            vec = captioner.embed_document(caption_text)
-
-            embedding_file = output_path / f"{video_name}.npy"
-            np.save(embedding_file, np.asarray(vec, dtype=np.float32))
-
-            metadata[video_name] = {
-                "source_path": str(video_file.absolute()),
-                "embedding_file": str(embedding_file.name),
-                "caption": caption_text,
-                "scene": cap.get("scene"),
-                "events": cap.get("events") or [],
-            }
-        except Exception as e:
-            logging.error(f"Error captioning {video_file.name}: {e}", exc_info=True)
-        finally:
-            processed_videos.add(video_name)
-            pbar.update(1)
-
-        # Save state periodically
-        if len(processed_videos) % 50 == 0:
-            remaining_list = [v for v in videos_to_process if v.stem not in processed_videos]
-            save_job_state(output_path, remaining_list, processed_videos, skipped_too_long, metadata)
-
-    pbar.close()
-
-    # Final state save
-    save_job_state(output_path, [], processed_videos, skipped_too_long, metadata)
-
-    # Save metadata
-    metadata_file = output_path / "metadata.json"
-    with open(metadata_file, "w") as f:
-        json.dump(
-            {
-                "marlin_model": MARLIN_MODEL,
-                "text_embed_model": TEXT_EMBED_MODEL,
-                "embedding_dim": captioner.TEXT_EMBED_DIM,
-                "videos": metadata,
-            },
-            f,
-            indent=2,
+        result = subprocess.run(
+            [
+                "scenedetect",
+                "-i", str(input_path),
+                "--min-scene-len", str(min_scene_len),
+                "--merge-last-scene",
+                "split-video",
+                "-o", str(output_path),
+            ],
+            capture_output=True,
+            text=True,
         )
-
-    print(f"\nDone! Processed {len(metadata)} videos")
-    print(f"Embeddings saved to: {output_path}")
-    print(f"Metadata saved to: {metadata_file}")
-
-    # Report skipped videos
-    if skipped_too_long:
-        print(f"\n⚠️  {len(skipped_too_long)} video(s) were skipped (duration > {MAX_VIDEO_DURATION_SECONDS}s):")
-        for video_file, duration in skipped_too_long:
-            if duration > 0:
-                print(f"  - {video_file.name} ({duration:.1f}s)")
-            else:
-                print(f"  - {video_file.name} (unable to read duration)")
+        if result.returncode == 0:
+            return (video_file, True, f"ok, {result.stdout}")
+        error_msg = result.stderr[:200] if result.stderr else "unknown error"
+        return (video_file, False, f"scenedetect error: {error_msg}")
+    except FileNotFoundError:
+        return (video_file, False, "scenedetect not found — install with: pip install scenedetect[opencv]")
+    except Exception as e:
+        return (video_file, False, str(e))
+    finally:
+        if temp_dir:
+            shutil.rmtree(temp_dir, ignore_errors=True)
 
 
-def main():
+def check_server(server_url: str) -> bool:
+    try:
+        r = requests.get(f"{server_url}/health", timeout=10)
+        return r.status_code == 200
+    except requests.RequestException:
+        return False
+
+
+def purge_collection(server_url: str, collection: str) -> None:
+    url = f"{server_url}/collections/{collection}/purge"
+    try:
+        r = requests.delete(url, timeout=30)
+        if r.status_code == 200:
+            d = r.json()
+            print(f"Purged collection '{collection}': "
+                  f"{d['purged_segments']} segments, {d['deleted_files']} files")
+        elif r.status_code == 404:
+            print(f"Collection '{collection}' does not exist yet — nothing to purge")
+        else:
+            print(f"Warning: purge returned {r.status_code}: {r.text}")
+    except requests.RequestException as e:
+        print(f"Warning: purge request failed: {e}")
+
+
+def upsert_video(
+    server_url: str,
+    video_path: Path,
+    collection: str,
+    tags: list[dict],
+    timeout: int,
+    retries: int,
+) -> dict | None:
+    """POST a video chunk to /upsert. Returns response JSON on success, None on failure."""
+    url = f"{server_url}/upsert"
+    data = {"collection": collection, "tags": json.dumps(tags)}
+    for attempt in range(1, retries + 1):
+        try:
+            with open(video_path, "rb") as fh:
+                r = requests.post(
+                    url,
+                    files={"file": (video_path.name, fh, "video/mp4")},
+                    data=data,
+                    timeout=timeout,
+                )
+            if r.status_code == 200:
+                return r.json()
+            log.warning(
+                "Attempt %d/%d — server %d for %s: %s",
+                attempt, retries, r.status_code, video_path.name, r.text[:200],
+            )
+        except requests.Timeout:
+            log.warning("Attempt %d/%d — timeout for %s", attempt, retries, video_path.name)
+        except requests.RequestException as e:
+            log.warning("Attempt %d/%d — request error for %s: %s", attempt, retries, video_path.name, e)
+        if attempt < retries:
+            time.sleep(5 * attempt)
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Caption videos and generate caption embeddings"
+        description="Scene-split videos, filter by duration, and upsert to server.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=__doc__,
     )
-    parser.add_argument(
-        "input_folder",
-        help="Folder containing video files",
-    )
-    parser.add_argument(
-        "output_folder",
-        help="Folder to save embeddings",
-    )
-    parser.add_argument(
-        "--resume",
-        action="store_true",
-        help="Resume from saved state if available",
-    )
+    parser.add_argument("input_dir", type=Path, help="Source folder of original videos")
+    parser.add_argument("output_dir", type=Path, help="Folder where scene chunks are written and kept")
+    parser.add_argument("--collection", required=True, help="Qdrant collection name")
+    parser.add_argument("--server", default="http://localhost:8004", metavar="URL",
+                        help="Server base URL (default: http://localhost:8004)")
+    parser.add_argument("--workers", type=int, default=4, metavar="N",
+                        help="Parallel workers for scene splitting (default: 4)")
+    parser.add_argument("--upsert-workers", type=int, default=4, metavar="N",
+                        help="Parallel workers for HTTP upsert (default: 4)")
+    parser.add_argument("--min-scene-len", type=float, default=1.0, metavar="SECS",
+                        help="Minimum scene length in seconds (default: 1.0)")
+    parser.add_argument("--max-duration", type=float, default=20.0, metavar="SECS",
+                        help="Drop chunks longer than this many seconds (default: 20.0)")
+    parser.add_argument("--tags-file", metavar="FILE",
+                        help="JSON file mapping source video stem → list of {name, start, end} tag objects")
+    parser.add_argument("--timeout", type=int, default=300, metavar="SECS",
+                        help="Per-chunk HTTP timeout in seconds (default: 300)")
+    parser.add_argument("--retries", type=int, default=3, metavar="N",
+                        help="Retry attempts per chunk on failure (default: 3)")
+    parser.add_argument("--purge", action="store_true",
+                        help="Purge the collection before upserting")
+    parser.add_argument("--dry-run", "-n", action="store_true",
+                        help="Print plan without executing")
+    parser.add_argument("--pattern", default="**/*.mp4",
+                        help="Glob pattern for input videos (default: **/*.mp4)")
+    parser.add_argument("-v", "--verbose", action="store_true", help="Verbose output")
 
     args = parser.parse_args()
 
-    if not os.path.isdir(args.input_folder):
-        print(f"Error: Input folder does not exist: {args.input_folder}")
+    if args.verbose:
+        logging.getLogger().setLevel(logging.INFO)
+
+    if not args.input_dir.is_dir():
+        print(f"Error: input directory does not exist: {args.input_dir}", file=sys.stderr)
         sys.exit(1)
 
-    preprocess_folder(
-        args.input_folder,
-        args.output_folder,
-        resume=args.resume,
-    )
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    server_url = args.server.rstrip("/")
+
+    # -- Load tags ------------------------------------------------------------
+    tags_mapping: dict[str, list[dict]] = {}
+    if args.tags_file:
+        tags_path = Path(args.tags_file)
+        if not tags_path.exists():
+            print(f"Error: tags file not found: {tags_path}", file=sys.stderr)
+            sys.exit(1)
+        tags_mapping = json.loads(tags_path.read_text())
+        print(f"Loaded tags for {len(tags_mapping)} video(s)")
+
+    # -----------------------------------------------------------------------
+    # Step 1 — Scene detection (parallel, resumable)
+    # -----------------------------------------------------------------------
+    source_videos = sorted(args.input_dir.glob(args.pattern))
+    source_videos = [v for v in source_videos if v.suffix.lower() in VIDEO_EXTENSIONS]
+    if not source_videos:
+        print(f"No video files matching '{args.pattern}' in {args.input_dir}")
+        sys.exit(0)
+
+    # Map sanitized stem → original stem for tags lookups after chunking
+    sanitized_to_original = {sanitize_stem(v.stem): v.stem for v in source_videos}
+
+    already_split = get_processed_video_names(args.output_dir)
+    to_split = [v for v in source_videos if sanitize_stem(v.stem) not in already_split]
+    print(f"Found {len(source_videos)} source video(s): "
+          f"{len(already_split)} already split, {len(to_split)} to process")
+
+    if to_split and not args.dry_run:
+        print(f"Splitting {len(to_split)} video(s) with {args.workers} worker(s) "
+              f"(min-scene-len={args.min_scene_len}s) …")
+        split_errors: list[str] = []
+        with ThreadPoolExecutor(max_workers=args.workers) as executor:
+            futures = {
+                executor.submit(split_video, v, args.output_dir, args.min_scene_len): v
+                for v in to_split
+            }
+            for i, future in enumerate(as_completed(futures), 1):
+                video_file, ok, msg = future.result()
+                status = "✓" if ok else "✗"
+                print(f"  [{i}/{len(to_split)}] {status} {video_file.name}: {msg}")
+                if not ok:
+                    split_errors.append(video_file.name)
+        if split_errors:
+            print(f"Warning: {len(split_errors)} video(s) failed to split")
+
+    # -----------------------------------------------------------------------
+    # Step 2 — Duration filter
+    # -----------------------------------------------------------------------
+    all_chunks = sorted(args.output_dir.glob("*-Scene-*.mp4"))
+    if not all_chunks:
+        print("No scene chunks found in output directory.")
+        sys.exit(0)
+
+    print(f"\nChecking duration of {len(all_chunks)} chunk(s) (max {args.max_duration}s) …")
+    kept: list[Path] = []
+    dropped: list[str] = []
+    for chunk in tqdm(all_chunks, unit="chunk", leave=False, disable=args.dry_run):
+        dur = get_video_duration(chunk)
+        if dur > args.max_duration:
+            dropped.append(f"{chunk.name} ({dur:.1f}s)")
+        else:
+            kept.append(chunk)
+
+    if dropped:
+        print(f"Dropped {len(dropped)} chunk(s) over {args.max_duration}s: "
+              + ", ".join(dropped[:5]) + (" …" if len(dropped) > 5 else ""))
+    print(f"Chunks to upsert: {len(kept)}")
+
+    # -----------------------------------------------------------------------
+    # Dry run
+    # -----------------------------------------------------------------------
+    if args.dry_run:
+        print(f"\nDry run — would upsert {len(kept)} chunk(s) to '{args.collection}':")
+        for chunk in kept[:20]:
+            src = sanitized_to_original.get(source_stem(chunk.stem), source_stem(chunk.stem))
+            tags = tags_mapping.get(src, [])
+            tag_str = f"  [{', '.join(t['name'] for t in tags)}]" if tags else ""
+            print(f"  {chunk.name}{tag_str}")
+        if len(kept) > 20:
+            print(f"  … and {len(kept) - 20} more")
+        sys.exit(0)
+
+    if not kept:
+        print("Nothing to upsert.")
+        sys.exit(0)
+
+    # -----------------------------------------------------------------------
+    # Step 3 — Parallel upsert
+    # -----------------------------------------------------------------------
+    print(f"\nChecking server at {server_url} …")
+    if not check_server(server_url):
+        print(f"Error: server not reachable at {server_url}", file=sys.stderr)
+        sys.exit(1)
+    print("Server is healthy.")
+
+    if args.purge:
+        purge_collection(server_url, args.collection)
+
+    print(f"\nUpserting {len(kept)} chunk(s) to collection '{args.collection}' "
+          f"with {args.upsert_workers} worker(s) …")
+
+    success_count = 0
+    error_count = 0
+    errors: list[str] = []
+
+    with ThreadPoolExecutor(max_workers=args.upsert_workers) as executor:
+        futures = {
+            executor.submit(
+                upsert_video,
+                server_url,
+                chunk,
+                args.collection,
+                tags_mapping.get(sanitized_to_original.get(source_stem(chunk.stem), source_stem(chunk.stem)), []),
+                args.timeout,
+                args.retries,
+            ): chunk
+            for chunk in kept
+        }
+        pbar = tqdm(as_completed(futures), total=len(kept), unit="chunk")
+        for future in pbar:
+            chunk = futures[future]
+            pbar.set_description(chunk.stem[:40])
+            result = future.result()
+            if result:
+                success_count += 1
+                log.info("OK  %s → %s", chunk.name, result.get("minio_path", ""))
+            else:
+                error_count += 1
+                errors.append(chunk.name)
+                tqdm.write(f"FAILED  {chunk.name}")
+
+    # -----------------------------------------------------------------------
+    # Summary
+    # -----------------------------------------------------------------------
+    print()
+    print("Done.")
+    print(f"  Upserted: {success_count}")
+    print(f"  Failed:   {error_count}")
+    if dropped:
+        print(f"  Dropped (too long): {len(dropped)}")
+    if errors:
+        print("\nFailed chunks:")
+        for name in errors:
+            print(f"  {name}")
+        sys.exit(1)
 
 
 if __name__ == "__main__":

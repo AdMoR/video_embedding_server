@@ -6,6 +6,9 @@ import os
 import sys
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).parent))
+from caption_formatters import FORMATTERS
+
 import boto3
 from botocore.client import Config
 from qdrant_client import QdrantClient
@@ -48,7 +51,26 @@ def main():
     parser.add_argument("collection", help="Qdrant collection name")
     parser.add_argument("--limit", "-n", type=int, default=None, help="Download only the top N segments")
     parser.add_argument("--output", "-o", default=None, help="Output directory (default: ./<collection>)")
+    parser.add_argument(
+        "--output-format",
+        choices=["raw", "ai-toolkit"],
+        default="raw",
+        help="Output format: 'raw' (captions.json) or 'ai-toolkit' (per-file .txt sidecars)",
+    )
+    parser.add_argument(
+        "--caption-module",
+        default="narrative",
+        help="Caption formatter for ai-toolkit mode (default: narrative)",
+    )
     args = parser.parse_args()
+
+    formatter = None
+    if args.output_format == "ai-toolkit":
+        if args.caption_module not in FORMATTERS:
+            available = ", ".join(sorted(FORMATTERS))
+            print(f"Unknown caption module '{args.caption_module}'. Available: {available}", file=sys.stderr)
+            sys.exit(1)
+        formatter = FORMATTERS[args.caption_module]()
 
     output_dir = Path(args.output) if args.output else Path(args.collection)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -90,11 +112,24 @@ def main():
             "source_path": source_path,
         })
 
+        if source_path.startswith("minio://"):
+            filename = Path(source_path).name
+            stem = Path(filename).stem
+        else:
+            filename = None
+            stem = video_id
+
+        if formatter is not None:
+            txt_path = output_dir / f"{stem}.txt"
+            try:
+                txt_path.write_text(formatter.format(point.payload), encoding="utf-8")
+            except Exception as e:
+                print(f"  Warning: caption write failed for {stem}: {e}", file=sys.stderr)
+
         if not source_path.startswith("minio://"):
             print(f"[{i+1}/{len(segments)}] No MinIO path for {video_id}, skipping")
             continue
 
-        filename = Path(source_path).name
         dest = output_dir / filename
         if dest.exists():
             print(f"[{i+1}/{len(segments)}] Already exists: {filename}")
@@ -107,10 +142,13 @@ def main():
         except Exception as e:
             print(f"  Error: {e}", file=sys.stderr)
 
-    captions_path = output_dir / "captions.json"
-    with open(captions_path, "w") as f:
-        json.dump(captions, f, indent=2)
-    print(f"Saved {len(captions)} captions to {captions_path}")
+    if args.output_format == "raw":
+        captions_path = output_dir / "captions.json"
+        with open(captions_path, "w") as f:
+            json.dump(captions, f, indent=2)
+        print(f"Saved {len(captions)} captions to {captions_path}")
+    else:
+        print(f"Wrote {len(segments)} caption files to {output_dir}")
 
 
 if __name__ == "__main__":

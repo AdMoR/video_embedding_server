@@ -54,6 +54,7 @@ class VectorStore:
         caption: str = "",
         scene: str = "",
         events: list[dict] | None = None,
+        transcription: list[dict] | None = None,
     ) -> None:
         """Insert or update a segment.
 
@@ -69,6 +70,7 @@ class VectorStore:
             caption: Generated caption text for the video.
             scene: Parsed scene paragraph from the caption.
             events: List of dense event dicts with keys: start, end, description.
+            transcription: Whisper segments with keys: start, end, text.
         """
         tag_names = [t["name"] for t in tags]
         self.client.upsert(
@@ -87,6 +89,7 @@ class VectorStore:
                         "caption": caption,
                         "scene": scene,
                         "events": events or [],
+                        "transcription": transcription or [],
                     },
                 )
             ],
