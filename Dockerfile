@@ -50,6 +50,7 @@ COPY base_captioner.py base_captioner.py
 COPY chai_captioner.py chai_captioner.py
 COPY marlin_captioner.py marlin_captioner.py
 COPY captioner.py captioner.py
+COPY transcriber.py transcriber.py
 COPY server.py server.py
 COPY storage.py storage.py
 COPY minio_client.py minio_client.py

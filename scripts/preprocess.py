@@ -86,15 +86,16 @@ def split_video(
     video_file: Path,
     output_path: Path,
     min_scene_len: float,
-) -> tuple[Path, bool, str]:
+) -> tuple[Path, bool, str, str | None]:
     """Run scenedetect on a single video.
 
-    Copies the file to a temp path with a sanitized name first so that
-    dots (non-extension separators), spaces, and other special characters
-    don't confuse ffmpeg or scenedetect.
+    Returns (video_file, ok, message, temp_dir_to_cleanup). The caller is
+    responsible for deleting temp_dir_to_cleanup after ALL workers have
+    finished so that any ffmpeg child processes scenedetect may have spawned
+    can still access the file until they exit.
     """
     safe_stem = sanitize_stem(video_file.stem)
-    temp_dir = None
+    temp_dir: str | None = None
     try:
         if safe_stem != video_file.stem:
             temp_dir = tempfile.mkdtemp()
@@ -112,20 +113,18 @@ def split_video(
                 "split-video",
                 "-o", str(output_path),
             ],
-            capture_output=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
             text=True,
         )
         if result.returncode == 0:
-            return (video_file, True, f"ok, {result.stdout}")
-        error_msg = result.stderr[:200] if result.stderr else "unknown error"
-        return (video_file, False, f"scenedetect error: {error_msg}")
+            return (video_file, True, "ok", temp_dir)
+        error_msg = result.stderr[:500] if result.stderr else "unknown error"
+        return (video_file, False, f"scenedetect error: {error_msg}", temp_dir)
     except FileNotFoundError:
-        return (video_file, False, "scenedetect not found — install with: pip install scenedetect[opencv]")
+        return (video_file, False, "scenedetect not found — install with: pip install scenedetect[opencv]", temp_dir)
     except Exception as e:
-        return (video_file, False, str(e))
-    finally:
-        if temp_dir:
-            shutil.rmtree(temp_dir, ignore_errors=True)
+        return (video_file, False, str(e), temp_dir)
 
 
 def check_server(server_url: str) -> bool:
@@ -267,17 +266,23 @@ def main() -> None:
         print(f"Splitting {len(to_split)} video(s) with {args.workers} worker(s) "
               f"(min-scene-len={args.min_scene_len}s) …")
         split_errors: list[str] = []
+        temp_dirs_to_cleanup: list[str] = []
         with ThreadPoolExecutor(max_workers=args.workers) as executor:
             futures = {
                 executor.submit(split_video, v, args.output_dir, args.min_scene_len): v
                 for v in to_split
             }
             for i, future in enumerate(as_completed(futures), 1):
-                video_file, ok, msg = future.result()
+                video_file, ok, msg, temp_dir = future.result()
+                if temp_dir:
+                    temp_dirs_to_cleanup.append(temp_dir)
                 status = "✓" if ok else "✗"
                 print(f"  [{i}/{len(to_split)}] {status} {video_file.name}: {msg}")
                 if not ok:
                     split_errors.append(video_file.name)
+        # All workers finished — safe to remove temp copies now
+        for d in temp_dirs_to_cleanup:
+            shutil.rmtree(d, ignore_errors=True)
         if split_errors:
             print(f"Warning: {len(split_errors)} video(s) failed to split")
 

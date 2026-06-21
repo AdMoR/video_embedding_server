@@ -53,9 +53,9 @@ def main():
     parser.add_argument("--output", "-o", default=None, help="Output directory (default: ./<collection>)")
     parser.add_argument(
         "--output-format",
-        choices=["raw", "ai-toolkit"],
+        choices=["raw", "ai-toolkit", "ltx_trainer"],
         default="raw",
-        help="Output format: 'raw' (captions.json) or 'ai-toolkit' (per-file .txt sidecars)",
+        help="Output format: 'raw' (captions.json), 'ai-toolkit' (per-file .txt sidecars), or 'ltx_trainer' (ltx_trainer.json with caption+video path)",
     )
     parser.add_argument(
         "--caption-module",
@@ -65,7 +65,7 @@ def main():
     args = parser.parse_args()
 
     formatter = None
-    if args.output_format == "ai-toolkit":
+    if args.output_format in ("ai-toolkit", "ltx_trainer"):
         if args.caption_module not in FORMATTERS:
             available = ", ".join(sorted(FORMATTERS))
             print(f"Unknown caption module '{args.caption_module}'. Available: {available}", file=sys.stderr)
@@ -96,6 +96,7 @@ def main():
     print(f"Found {len(segments)} segments")
 
     captions = []
+    ltx_entries = []
     for i, point in enumerate(segments):
         payload = point.payload
         video_id = payload.get("video_id", str(point.id))
@@ -119,7 +120,7 @@ def main():
             filename = None
             stem = video_id
 
-        if formatter is not None:
+        if formatter is not None and args.output_format == "ai-toolkit":
             txt_path = output_dir / f"{stem}.txt"
             try:
                 txt_path.write_text(formatter.format(point.payload), encoding="utf-8")
@@ -133,20 +134,28 @@ def main():
         dest = output_dir / filename
         if dest.exists():
             print(f"[{i+1}/{len(segments)}] Already exists: {filename}")
-            continue
+        else:
+            print(f"[{i+1}/{len(segments)}] Downloading {filename}...")
+            try:
+                bucket, key = parse_minio_uri(source_path)
+                s3.download_file(bucket, key, str(dest))
+            except Exception as e:
+                print(f"  Error: {e}", file=sys.stderr)
 
-        print(f"[{i+1}/{len(segments)}] Downloading {filename}...")
-        try:
-            bucket, key = parse_minio_uri(source_path)
-            s3.download_file(bucket, key, str(dest))
-        except Exception as e:
-            print(f"  Error: {e}", file=sys.stderr)
+        if args.output_format == "ltx_trainer" and dest.exists():
+            caption_text = formatter.format(point.payload) if formatter else point.payload.get("caption", "")
+            ltx_entries.append({"caption": caption_text, "video": str(dest.resolve())})
 
     if args.output_format == "raw":
         captions_path = output_dir / "captions.json"
         with open(captions_path, "w") as f:
             json.dump(captions, f, indent=2)
         print(f"Saved {len(captions)} captions to {captions_path}")
+    elif args.output_format == "ltx_trainer":
+        ltx_path = output_dir / "ltx_trainer.json"
+        with open(ltx_path, "w") as f:
+            json.dump(ltx_entries, f, indent=2)
+        print(f"Saved {len(ltx_entries)} entries to {ltx_path}")
     else:
         print(f"Wrote {len(segments)} caption files to {output_dir}")
 
